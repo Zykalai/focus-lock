@@ -1671,18 +1671,18 @@ function Invoke-LockUI {
     }
 
     $C = @{
-        Bg      = [System.Drawing.Color]::FromArgb(255, 246, 236)
-        Card    = [System.Drawing.Color]::FromArgb(255, 255, 255)
-        Text    = [System.Drawing.Color]::FromArgb(91, 74, 111)
-        Muted   = [System.Drawing.Color]::FromArgb(170, 156, 190)
-        Accent  = [System.Drawing.Color]::FromArgb(255, 138, 173)
-        Accent2 = [System.Drawing.Color]::FromArgb(118, 199, 226)
-        Accent3 = [System.Drawing.Color]::FromArgb(255, 201, 92)
-        Purple  = [System.Drawing.Color]::FromArgb(150, 122, 224)
-        Danger  = [System.Drawing.Color]::FromArgb(255, 107, 129)
-        OK      = [System.Drawing.Color]::FromArgb(94, 199, 145)
-        Line    = [System.Drawing.Color]::FromArgb(252, 228, 216)
-        InputBg = [System.Drawing.Color]::FromArgb(243, 238, 255)
+        Bg      = [System.Drawing.Color]::FromArgb(10, 12, 18)
+        Card    = [System.Drawing.Color]::FromArgb(24, 28, 40)
+        Text    = [System.Drawing.Color]::FromArgb(200, 198, 194)
+        Muted   = [System.Drawing.Color]::FromArgb(104, 110, 128)
+        Accent  = [System.Drawing.Color]::FromArgb(104, 122, 184)
+        Accent2 = [System.Drawing.Color]::FromArgb(76, 122, 150)
+        Accent3 = [System.Drawing.Color]::FromArgb(184, 150, 92)
+        Purple  = [System.Drawing.Color]::FromArgb(148, 138, 208)
+        Danger  = [System.Drawing.Color]::FromArgb(190, 104, 112)
+        OK      = [System.Drawing.Color]::FromArgb(88, 156, 128)
+        Line    = [System.Drawing.Color]::FromArgb(38, 44, 60)
+        InputBg = [System.Drawing.Color]::FromArgb(30, 35, 48)
     }
 
     $cg = [int]$Config.challenge.groups
@@ -1822,7 +1822,7 @@ function Invoke-LockUI {
     $sep2 = New-Separator
 
     $btnDoubao = New-RoundButton -Text '打开豆包' -W 200 -H 46 -Back $C.Accent -Fore ([System.Drawing.Color]::White) -FontSize 13
-    $btnShutdown = New-RoundButton -Text '立刻关机' -W 200 -H 46 -Back $C.Purple -Fore ([System.Drawing.Color]::White) -FontSize 13
+    $btnShutdown = New-RoundButton -Text '立刻关机' -W 200 -H 46 -Back ([System.Drawing.Color]::FromArgb(62, 68, 86)) -Fore ([System.Drawing.Color]::FromArgb(176, 176, 186)) -FontSize 13
     $btnSubmit = New-RoundButton -Text '确认' -W 108 -H 44 -Back $C.Accent2 -Fore ([System.Drawing.Color]::White) -FontSize 13
     $script:ShutdownArmed = $false
 
