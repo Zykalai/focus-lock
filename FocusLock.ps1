@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('lock', 'lock-ui', 'tick', 'guard', 'unlock', 'settings')]
+    [ValidateSet('lock', 'lock-ui', 'lock-ask', 'tick', 'guard', 'unlock', 'settings')]
     [string]$Mode = 'lock',
     [int]$Minutes = 0
 )
@@ -1257,6 +1257,10 @@ function Invoke-Settings {
             $c2.window.end = $he
             $c2.window.skipDays = @($skipDays)
             Save-FocusConfig -Config $c2
+
+            # 保存设置 = 主动重置：清掉"今天这份已作废"的记录，
+            # 这样如果当前时间落在区间内，tick 会立刻重新锁上。
+            Remove-Item -LiteralPath $script:StatePath -Force -ErrorAction SilentlyContinue
             Write-FocusLog 'settings-saved' ("$hs-$he skip=" + ($skipDays -join ',') + " release=$mins")
 
             $lMsg.Text = '已保存'
@@ -1338,6 +1342,194 @@ function Get-NextBoundary {
     if ($list.Count -eq 0) { return $null }
     $sorted = @($list | Sort-Object)
     return $sorted[0]
+}
+function Invoke-LockAsk {
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $S = 1.0
+    try {
+        $ap = (Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name AppliedDPI -ErrorAction SilentlyContinue).AppliedDPI
+        if ($ap) { $S = [double]$ap / 96.0 }
+    } catch { }
+    if ($S -lt 1.0) { $S = 1.0 }
+    function Px { param([double]$v) return [int]($v * $S) }
+
+    $C = @{
+        Bg     = [System.Drawing.Color]::FromArgb(255, 246, 236)
+        Input  = [System.Drawing.Color]::FromArgb(243, 238, 255)
+        Text   = [System.Drawing.Color]::FromArgb(91, 74, 111)
+        Muted  = [System.Drawing.Color]::FromArgb(170, 156, 190)
+        Accent = [System.Drawing.Color]::FromArgb(255, 138, 173)
+    }
+
+    function P-Region {
+        param($W, $H, $R)
+        $d = $R * 2
+        if ($d -gt $W) { $d = $W }
+        if ($d -gt $H) { $d = $H }
+        $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $p.AddArc(0, 0, $d, $d, 180, 90)
+        $p.AddArc($W - $d - 1, 0, $d, $d, 270, 90)
+        $p.AddArc($W - $d - 1, $H - $d - 1, $d, $d, 0, 90)
+        $p.AddArc(0, $H - $d - 1, $d, $d, 90, 90)
+        $p.CloseFigure()
+        return (New-Object System.Drawing.Region($p))
+    }
+
+    function P-Label {
+        param($T, $Size, $Color, $Bold = $false)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $T
+        $l.AutoSize = $true
+        $l.ForeColor = $Color
+        $l.BackColor = [System.Drawing.Color]::Transparent
+        $st = [System.Drawing.FontStyle]::Regular
+        if ($Bold) { $st = [System.Drawing.FontStyle]::Bold }
+        try { $l.Font = New-Object System.Drawing.Font('幼圆', $Size, $st) } catch { }
+        return $l
+    }
+
+    function P-Btn {
+        param($T, $W, $H, $Back, $Fore, $Size)
+        $w = Px $W
+        $h = Px $H
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $T
+        $b.Size = New-Object System.Drawing.Size($w, $h)
+        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $b.FlatAppearance.BorderSize = 0
+        $b.BackColor = $Back
+        $b.ForeColor = $Fore
+        $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+        try { $b.Font = New-Object System.Drawing.Font('幼圆', $Size, [System.Drawing.FontStyle]::Bold) } catch { }
+        try { $b.Region = P-Region $w $h (Px 12) } catch { }
+        return $b
+    }
+
+    $picked = 0
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'FocusLock'
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $form.ClientSize = New-Object System.Drawing.Size((Px 420), (Px 300))
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.BackColor = $C.Bg
+    $form.ForeColor = $C.Text
+
+    $lTitle = P-Label '锁多久？' 20 $C.Text $true
+    $lTitle.Left = Px 30; $lTitle.Top = Px 24
+
+    $quick = @(15, 30, 60, 120)
+    $qbtns = @()
+    for ($i = 0; $i -lt 4; $i++) {
+        $b = P-Btn (([string]$quick[$i]) + ' 分钟') 84 46 $C.Input $C.Text 11
+        $b.Left = Px (30 + ($i * 92))
+        $b.Top = Px 70
+        $idx = $quick[$i]
+        $b.Tag = $idx
+        $qbtns += $b
+        $form.Controls.Add($b)
+    }
+
+    $lCustom = P-Label '自定义' 11 $C.Muted
+    $lCustom.Left = Px 30; $lCustom.Top = Px 140
+
+    $pnl = New-Object System.Windows.Forms.Panel
+    $pnl.Size = New-Object System.Drawing.Size((Px 120), (Px 42))
+    $pnl.Left = Px 88; $pnl.Top = Px 132
+    $pnl.BackColor = $C.Input
+    try { $pnl.Region = P-Region (Px 120) (Px 42) (Px 10) } catch { }
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $tb.BackColor = $C.Input
+    $tb.ForeColor = $C.Text
+    $tb.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+    $tb.Width = Px 96
+    $tb.Left = Px 12
+    $tb.Top = Px 9
+    $tb.Text = '30'
+    try { $tb.Font = New-Object System.Drawing.Font('Consolas', 14, [System.Drawing.FontStyle]::Bold) } catch { }
+    $pnl.Controls.Add($tb)
+
+    $lUnit = P-Label '分钟' 11 $C.Muted
+    $lUnit.Left = Px 216; $lUnit.Top = Px 140
+
+    $lHint = P-Label '期间只能用豆包　·　1000 位数字 或 unlock.cmd 可解' 9 $C.Muted
+    $lHint.Left = Px 30; $lHint.Top = Px 190
+
+    $bOK = P-Btn '开始' 110 44 $C.Accent ([System.Drawing.Color]::White) 12
+    $bOK.Left = Px 30; $bOK.Top = Px 226
+
+    $bNo = P-Btn '取消' 110 44 $C.Input $C.Text 12
+    $bNo.Left = Px 156; $bNo.Top = Px 226
+
+    foreach ($ctl in @($lTitle, $lCustom, $pnl, $lUnit, $lHint, $bOK, $bNo)) { $form.Controls.Add($ctl) }
+
+    # 快捷按钮：点了直接填进输入框
+    foreach ($b in $qbtns) {
+        $b.Add_Click({
+            param($sender, $e)
+            $tb.Text = [string]$sender.Tag
+            $tb.Focus()
+            $tb.SelectAll()
+        })
+    }
+
+    $bOK.Add_Click({
+        $v = 0
+        if ([int]::TryParse($tb.Text.Trim(), [ref]$v)) {
+            if ($v -ge 1 -and $v -le 1440) {
+                $script:AskResult = $v
+                $form.Close()
+                return
+            }
+        }
+        $lHint.Text = '请输入 1 到 1440 之间的整数'
+        $lHint.ForeColor = $C.Accent
+    })
+
+    $bNo.Add_Click({ $script:AskResult = 0; $form.Close() })
+    $tb.Add_KeyDown({
+        param($sender, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $bOK.PerformClick() }
+    })
+
+    $script:AskResult = 0
+
+    $form.Add_Shown({
+        try {
+            $form.Activate()
+            $form.BringToFront()
+            $form.TopMost = $true
+            $form.TopMost = $false
+            [void][FocusLockNative.Win32]::SetForegroundWindow($form.Handle)
+        } catch { }
+        $tb.Focus()
+        $tb.SelectAll()
+    })
+
+    try { [System.Windows.Forms.Application]::Run($form) }
+    finally { try { $form.Dispose() } catch { } }
+
+    $mins = [int]$script:AskResult
+    if ($mins -le 0) {
+        Write-FocusLog 'lock-ask' '用户取消'
+        return
+    }
+
+    [void](New-ManualLock -Minutes $mins)
+    Write-FocusLog 'lock-ask' ("锁定 $mins 分钟")
+
+    $cfg = Get-FocusConfig
+    if (-not (Test-NamedMutexHeld $script:MutexUI)) {
+        [void](Start-FocusChild -ChildMode 'lock-ui')
+        [void](Start-FocusChild -ChildMode 'guard')
+    }
 }
 function Invoke-Tick {
 
@@ -2033,6 +2225,10 @@ switch ($Mode) {
             [void](Start-FocusChild -ChildMode 'lock-ui')
             [void](Start-FocusChild -ChildMode 'guard')
         }
+    }
+
+    'lock-ask' {
+        Invoke-LockAsk
     }
 
     'lock-ui' {
