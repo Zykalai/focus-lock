@@ -2018,6 +2018,7 @@ function Invoke-LockUI {
     $script:CfgAt = Get-Date
     $script:LastClockText = ''
     $script:LastRemainText = ''
+    $script:LastFooterText = ''
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 250
     $timer.Add_Tick({
@@ -2052,10 +2053,23 @@ function Invoke-LockUI {
                 $span = $chainEnd - $now
                 if ($span.TotalSeconds -lt 0) { $span = [timespan]::Zero }
                 $remainText = ('距离自动解锁还有 {0:hh\:mm\:ss}' -f $span)
+                $footerTime = $chainEnd.ToString('HH:mm')
+            } else {
+                $footerTime = '--:--'
             }
+
+            # 底栏跟着当前生效区间的终点走，不再固定显示熬夜锁配置的结束时间
+            $footerText = ('FocusLock v{0}　·　{1} 自动解锁　·　也可运行 Unlock.cmd 立即解锁' -f $script:Version, $footerTime)
+            if ($Preview) { $footerText = '【预览模式】' + $footerText }
+            if ($script:LastFooterText -ne $footerText) {
+                $script:LastFooterText = $footerText
+                try { $lblFooter.Text = $footerText } catch { }
+            }
+
+            # 倒计时那行
             if ($script:LastRemainText -ne $remainText) {
                 $script:LastRemainText = $remainText
-                $lblRemain.Text = $remainText
+                try { $lblRemain.Text = $remainText } catch { }
                 $needLayout = $true
             }
         }
@@ -2202,7 +2216,8 @@ function Invoke-LockUI {
 
     $form.Add_Resize({ Layout-Screen })
 
-    $lblFooter.Text = ('FocusLock v{0}　·　{1} 自动解锁　·　也可运行 Unlock.cmd 立即解锁' -f $script:Version, $Config.window.end)
+    # 底栏由 timer 动态刷新（显示当前实际生效区间的终点），这里只放个初值
+    $lblFooter.Text = ('FocusLock v{0}　·　也可运行 Unlock.cmd 立即解锁' -f $script:Version)
     if ($Preview) { $lblFooter.Text = '【预览模式 · 无任何实际限制】' + $lblFooter.Text }
 
     Write-FocusLog 'lock-ui-start' "preview=$($Preview.IsPresent)"
