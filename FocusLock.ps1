@@ -937,8 +937,7 @@ function Get-AutoWindowRange {
             $e = $d.AddDays(1).Add($endTs)
         }
 
-        # 只有真重叠才算相连；首尾相接（$s -eq $To）不算
-        if ($s -lt $To -and $From -lt $e) {
+        if ($s -le $To -and $From -le $e) {
             return [pscustomobject]@{
                 Active = $true
                 Start  = $s
@@ -951,6 +950,30 @@ function Get-AutoWindowRange {
     return $null
 }
 
+function Get-LockChainEnd {
+
+    # 从当前时刻出发，沿着「首尾相接或重叠」的区间一路往后延，
+    # 返回整条连通链的终点。倒计时显示这个终点，而不是当前那一段的终点。
+    #
+    # 例：快速锁 17:55-18:10 + 熬夜锁 18:00-19:00
+    #     17:55 时返回 19:00（18:10 那一刻熬夜锁接上了）
+    param([object]$Config, [datetime]$At = (Get-Date))
+
+    $win = Get-LockWindow -Config $Config -At $At
+    if (-not $win) { return $null }
+
+    $end = $win.End
+
+    for ($i = 0; $i -lt 32; $i++) {
+        # 看 $end 那一刻还有没有区间覆盖（左闭右开，所以相接的会命中）
+        $next = Get-LockWindow -Config $Config -At $end
+        if (-not $next) { break }
+        if ($next.End -le $end) { break }
+        $end = $next.End
+    }
+
+    return $end
+}
 function Get-UnlockSet {
 
     # 算出解锁要解除哪些区间。
@@ -987,8 +1010,7 @@ function Get-UnlockSet {
             $ms = [datetime]::MinValue
             $me = [datetime]::MinValue
             if ([datetime]::TryParse([string]$ml.start, [ref]$ms) -and [datetime]::TryParse([string]$ml.end, [ref]$me)) {
-                # 只有真重叠才连带解除，首尾相接不解除
-                if ($ms -lt $aw.End -and $aw.Start -lt $me) {
+                if ($ms -le $aw.End -and $aw.Start -le $me) {
                     $res.Manual = $true
                     $res.ManualWin = [pscustomobject]@{
                         Active = $true
@@ -2024,7 +2046,10 @@ function Invoke-LockUI {
             $win = Get-LockWindow -Config $cfgNow -At $now
             $remainText = '当前不在锁定时段'
             if ($win) {
-                $span = $win.End - $now
+                # 沿着相接/重叠的区间往后延，显示整条链的终点
+                $chainEnd = Get-LockChainEnd -Config $cfgNow -At $now
+                if (-not $chainEnd) { $chainEnd = $win.End }
+                $span = $chainEnd - $now
                 if ($span.TotalSeconds -lt 0) { $span = [timespan]::Zero }
                 $remainText = ('距离自动解锁还有 {0:hh\:mm\:ss}' -f $span)
             }
