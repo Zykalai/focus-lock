@@ -1,0 +1,11 @@
+# 运行时文件（在 %LOCALAPPDATA%\FocusLock 里，不会进仓库，这里只是保险）
+config.json
+state.json
+manual.json
+focuslock.log
+taskbar.hidden
+
+# 构建产物
+build/
+*.png
+*.bak
