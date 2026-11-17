@@ -1746,8 +1746,17 @@ function Confirm-Shutdown {
         try { $bNo.Focus() } catch { }
     })
 
-    try { [System.Windows.Forms.Application]::Run($dlg) }
-    finally { try { $dlg.Dispose() } catch { } }
+    # 用 ShowDialog 而不是 Application::Run ——
+    # 锁屏本身已经跑着 Application::Run，再嵌一层会把主消息循环搞坏，
+    # 之后在事件里调 Start-Process 会抛异常。
+    try {
+        [void]$dlg.ShowDialog()
+    } catch {
+        Write-FocusLog 'confirm-fail' $_.Exception.Message
+        return $false
+    } finally {
+        try { $dlg.Dispose() } catch { }
+    }
 
     return ([string]$dlg.Tag -eq 'yes')
 }
@@ -2284,7 +2293,9 @@ function Invoke-LockUI {
             }
 
 
-            $r = Start-Process -FilePath 'shutdown.exe' -ArgumentList '/s','/t','0','/f' -WindowStyle Hidden -PassThru -Wait -ErrorAction Stop
+            $sdExe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+            if (-not (Test-Path -LiteralPath $sdExe)) { $sdExe = 'shutdown.exe' }
+            $r = Start-Process -FilePath $sdExe -ArgumentList '/s','/t','0','/f' -WindowStyle Hidden -PassThru -Wait -ErrorAction Stop
             if ($r.ExitCode -eq 0) {
                 $lblMsg.ForeColor = $C.OK
                 $lblMsg.Text = '正在关机…'
@@ -2298,6 +2309,7 @@ function Invoke-LockUI {
         } catch {
             $lblMsg.ForeColor = $C.Danger
             $lblMsg.Text = '关机指令发送失败。'
+            Write-FocusLog 'shutdown-fail' $_.Exception.Message
             Layout-OnCard
         }
     })
