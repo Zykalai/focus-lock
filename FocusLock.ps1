@@ -937,7 +937,8 @@ function Get-AutoWindowRange {
             $e = $d.AddDays(1).Add($endTs)
         }
 
-        if ($s -le $To -and $From -le $e) {
+        # 只有真重叠才算相连；首尾相接（$s -eq $To）不算
+        if ($s -lt $To -and $From -lt $e) {
             return [pscustomobject]@{
                 Active = $true
                 Start  = $s
@@ -986,7 +987,8 @@ function Get-UnlockSet {
             $ms = [datetime]::MinValue
             $me = [datetime]::MinValue
             if ([datetime]::TryParse([string]$ml.start, [ref]$ms) -and [datetime]::TryParse([string]$ml.end, [ref]$me)) {
-                if ($ms -le $aw.End -and $aw.Start -le $me) {
+                # 只有真重叠才连带解除，首尾相接不解除
+                if ($ms -lt $aw.End -and $aw.Start -lt $me) {
                     $res.Manual = $true
                     $res.ManualWin = [pscustomobject]@{
                         Active = $true
