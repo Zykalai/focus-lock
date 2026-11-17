@@ -1653,6 +1653,104 @@ function Invoke-Guard {
     }
 }
 
+function Confirm-Shutdown {
+
+    param([object]$Colors)
+
+    # 自己算缩放，不依赖调用方的局部变量
+    $u2 = 1.0
+    try {
+        $ap = (Get-ItemProperty 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name AppliedDPI -ErrorAction SilentlyContinue).AppliedDPI
+        if ($ap) { $u2 = [double]$ap / 96.0 }
+    } catch { }
+    if ($u2 -lt 1.0) { $u2 = 1.0 }
+
+    $colCard = [System.Drawing.Color]::FromArgb(24, 28, 40)
+    $colText = [System.Drawing.Color]::FromArgb(200, 198, 194)
+    $colMuted = [System.Drawing.Color]::FromArgb(104, 110, 128)
+    if ($Colors) {
+        try { $colCard = $Colors.Card; $colText = $Colors.Text; $colMuted = $Colors.Muted } catch { }
+    }
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = '确认关机'
+    $dlg.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $dlg.ClientSize = New-Object System.Drawing.Size([int](380 * $u2), [int](216 * $u2))
+    $dlg.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = $colCard
+    $dlg.ForeColor = $colText
+    $dlg.TopMost = $true
+
+    function New-DlgLabel {
+        param([string]$T, [single]$Sz, [System.Drawing.Color]$C, [switch]$Bold)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $T
+        $l.AutoSize = $true
+        $l.BackColor = [System.Drawing.Color]::Transparent
+        $l.ForeColor = $C
+        $st = [System.Drawing.FontStyle]::Regular
+        if ($Bold) { $st = [System.Drawing.FontStyle]::Bold }
+        try { $l.Font = New-Object System.Drawing.Font('幼圆', $Sz, $st) } catch { }
+        return $l
+    }
+
+    function New-DlgButton {
+        param([string]$T, [int]$W, [int]$H, [System.Drawing.Color]$Back, [System.Drawing.Color]$Fore, [single]$Sz)
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $T
+        $b.Size = New-Object System.Drawing.Size($W, $H)
+        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $b.FlatAppearance.BorderSize = 0
+        $b.BackColor = $Back
+        $b.ForeColor = $Fore
+        $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+        try { $b.Font = New-Object System.Drawing.Font('幼圆', $Sz, [System.Drawing.FontStyle]::Bold) } catch { }
+        return $b
+    }
+
+    $lQ = New-DlgLabel -T '真的要关机吗？' -Sz 17 -C $colText -Bold
+    $lQ.Left = [int](30 * $u2); $lQ.Top = [int](28 * $u2)
+
+    $lWarn = New-DlgLabel -T '未保存的文档会丢失，无法撤销。' -Sz 11 -C $colMuted
+    $lWarn.Left = [int](30 * $u2); $lWarn.Top = [int](74 * $u2)
+
+    $bYes = New-DlgButton -T '关机' -W ([int](130 * $u2)) -H ([int](44 * $u2)) -Back ([System.Drawing.Color]::FromArgb(150, 76, 84)) -Fore ([System.Drawing.Color]::FromArgb(240, 232, 230)) -Sz 12
+    $bYes.Left = [int](30 * $u2); $bYes.Top = [int](136 * $u2)
+
+    $bNo = New-DlgButton -T '取消' -W ([int](130 * $u2)) -H ([int](44 * $u2)) -Back ([System.Drawing.Color]::FromArgb(42, 48, 62)) -Fore $colText -Sz 12
+    $bNo.Left = [int](180 * $u2); $bNo.Top = [int](136 * $u2)
+
+    $dlg.Controls.Add($lQ)
+    $dlg.Controls.Add($lWarn)
+    $dlg.Controls.Add($bYes)
+    $dlg.Controls.Add($bNo)
+
+    $dlg.KeyPreview = $true
+
+    $bYes.Add_Click({ $dlg.Tag = 'yes'; $dlg.Close() })
+    $bNo.Add_Click({ $dlg.Tag = 'no'; $dlg.Close() })
+    $dlg.Add_KeyDown({
+        param($sender, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $dlg.Tag = 'no'; $dlg.Close() }
+    })
+
+    $dlg.Add_Shown({
+        try {
+            $dlg.Activate()
+            $dlg.BringToFront()
+            if ('FocusLockNative.Win32' -as [type]) { [void][FocusLockNative.Win32]::SetForegroundWindow($dlg.Handle) }
+        } catch { }
+        try { $bNo.Focus() } catch { }
+    })
+
+    try { [System.Windows.Forms.Application]::Run($dlg) }
+    finally { try { $dlg.Dispose() } catch { } }
+
+    return ([string]$dlg.Tag -eq 'yes')
+}
 function Invoke-LockUI {
     param([object]$Config, [switch]$Preview, [int]$PreviewSeconds = 0)
 
@@ -2179,6 +2277,12 @@ function Invoke-LockUI {
 
     $btnShutdown.Add_Click({
         try {
+            # 先确认，防止误触
+            if (-not (Confirm-Shutdown -Colors $C)) {
+                Write-FocusLog 'shutdown-cancel' '用户取消关机'
+                return
+            }
+
 
             $r = Start-Process -FilePath 'shutdown.exe' -ArgumentList '/s','/t','0','/f' -WindowStyle Hidden -PassThru -Wait -ErrorAction Stop
             if ($r.ExitCode -eq 0) {
