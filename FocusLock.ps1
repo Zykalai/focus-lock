@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.2'
+$script:Version    = '1.2.3'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -17,7 +17,7 @@ $script:LogPath    = Join-Path $script:DataDir 'focuslock.log'
 $script:TaskName   = 'FocusLockGuard'
 $script:MutexUI    = 'Local\FocusLock.UI'
 $script:MutexGuard = 'Local\FocusLock.Guard'
-$script:EventUiReady = 'Local\FocusLock.UIReady'
+
 $script:SelfPath   = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 
 $script:CsSource = @'
@@ -243,20 +243,52 @@ function Test-NamedMutexHeld {
         if ($m) { try { $m.Dispose() } catch { } }
     }
 }
-function Test-LockUiReady {
+function Get-UptimeSeconds {
 
-    # 互斥体只能证明 lock-ui 进程活着，证明不了窗口画出来没有（互斥体建在 Show 之前）。
-    # 命名事件在 Shown 里才置位，两个都满足才算"遮罩看得见"
-    if (-not (Test-NamedMutexHeld $script:MutexUI)) { return $false }
-    $ev = $null
+    # 开机多久了。开机头一分钟是固定空窗期：tick、遮罩、guard 都还没起来。
+    # 注意 PS 5.1 的 .NET Framework 没有 Environment::TickCount64（取到 $null），
+    # 所以必须有 WMI 回退，否则会算出 0 秒、永远解不开
     try {
-        $ev = [System.Threading.EventWaitHandle]::OpenExisting($script:EventUiReady)
-        return $ev.WaitOne(0)
-    } catch {
-        return $false
-    } finally {
-        if ($ev) { try { $ev.Dispose() } catch { } }
-    }
+        $ms = [Environment]::TickCount64
+        if ($ms) { return ($ms / 1000) }
+    } catch { }
+    try {
+        return ((Get-Date) - (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime).TotalSeconds
+    } catch { return 999999 }
+}
+
+function Set-LockUiReady {
+
+    # 记下"遮罩已经画出来"的时刻；unlock 用它判断这次点击是不是发生在遮罩之后
+    try {
+        $o = @{ pid = $PID; at = (Get-Date).ToString('o') } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText((Join-Path $script:DataDir 'ui-ready.json'), $o)
+    } catch { }
+}
+
+function Clear-LockUiReady {
+    try { Remove-Item -LiteralPath (Join-Path $script:DataDir 'ui-ready.json') -Force -ErrorAction SilentlyContinue } catch { }
+}
+
+function Get-LockUiReadyAt {
+
+    # 返回"当前这一轮 lock-ui 真正显示出来的时刻"；没有可信记录就返回 $null
+    $readyFile = Join-Path $script:DataDir 'ui-ready.json'
+    if (-not (Test-Path -LiteralPath $readyFile)) { return $null }
+    try {
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop)) {
+            if (-not $p.CommandLine) { continue }
+            if ($p.CommandLine -notmatch '-Mode\s+lock-ui') { continue }
+            $gp = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+            if (-not $gp) { continue }
+            $u = Get-Content -LiteralPath $readyFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ([int]$u.pid -ne [int]$p.ProcessId) { continue }
+            $at = [datetime]$u.at
+            if ($at -lt $gp.StartTime) { continue }   # PID 复用留下的旧记录不算数
+            return $at
+        }
+    } catch { }
+    return $null
 }
 
 function Get-PowerShellExe {
@@ -972,14 +1004,21 @@ function Invoke-Unlock {
     # 两个区间只要有交集（并集连通），在并集内任何时刻解锁都同时解除两个
     $set = Get-UnlockSet -Config $cfg -At $now
 
-    # 解锁只能作用于看得见的锁：锁机时段内遮罩没在跑（典型是刚开机那几秒），
-    # 不写任何解锁状态，直接把遮罩补起来
-    if ((Get-LockWindow -Config $cfg -At $now) -and -not (Test-LockUiReady)) {
-        Write-FocusLog 'unlock-refused' '遮罩未显示，改为立即上锁'
-        Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
-        [void](Start-FocusChild -ChildMode 'lock-ui')
-        [void](Start-FocusChild -ChildMode 'guard')
-        return
+    # 解锁只认"看得见的锁"，两条同时满足才放行：
+    #   ① 开机满 60 秒——开机头几十秒 tick / 遮罩 / guard 都还没起来，这是固定空窗
+    #   ② 遮罩的显示时刻早于这次点击——点得比遮罩还早，说明是在缝隙里抢跑，不写解锁状态
+    if (Get-LockWindow -Config $cfg -At $now) {
+        $clickAt = (Get-Process -Id $PID).StartTime
+        $up = Get-UptimeSeconds
+        $readyAt = Get-LockUiReadyAt
+        if (($up -lt 60) -or ($null -eq $readyAt) -or ($readyAt -gt $clickAt)) {
+            $detail = '开机 {0:N0}s，遮罩 {1}' -f $up, $(if ($readyAt) { $readyAt.ToString('HH:mm:ss') } else { '无记录' })
+            Write-FocusLog 'unlock-refused' $detail
+            Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
+            [void](Start-FocusChild -ChildMode 'lock-ui')
+            [void](Start-FocusChild -ChildMode 'guard')
+            return
+        }
     }
     if ($set.Manual) {
         Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
@@ -1666,12 +1705,7 @@ function Invoke-LockUI {
         return
     }
 
-    # 遮罩真正显示后才置位；进程被杀时句柄自动关闭，事件对象随之消失
-    $uiReady = $null
-    try {
-        $uiReady = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $script:EventUiReady)
-        [void]$uiReady.Reset()
-    } catch { $uiReady = $null }
+
 
     $C = @{
         Bg      = [System.Drawing.Color]::FromArgb(10, 12, 18)
@@ -2198,7 +2232,7 @@ function Invoke-LockUI {
         $timer.Start()
         try { $form.Activate() } catch { }
         try { [void][FocusLockNative.Win32]::SetForegroundWindow($form.Handle) } catch { }
-        try { if ($uiReady) { [void]$uiReady.Set() } } catch { }
+        try { Set-LockUiReady } catch { }
     })
 
     $form.Add_Resize({ Layout-Screen })
@@ -2215,7 +2249,7 @@ function Invoke-LockUI {
         try { Set-TaskbarHidden -Hidden $false } catch { }
             try { [FocusLockNative.Win32]::Uninstall() } catch { }
             try { Set-TaskMgrBlocked -Blocked $false } catch { }
-        try { if ($uiReady) { [void]$uiReady.Reset(); $uiReady.Dispose() } } catch { }
+        try { Clear-LockUiReady } catch { }
         try { $mutex.Dispose() } catch { }
 
         Write-FocusLog 'lock-ui-exit' ''
