@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.0'
+$script:Version    = '1.2.1'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -241,6 +241,20 @@ function Test-NamedMutexHeld {
     } finally {
         if ($m) { try { $m.Dispose() } catch { } }
     }
+}
+function Test-LockUiVisible {
+
+    # 遮罩是不是真的画出来了。只看互斥体不够：lock-ui 在 Show 之前就已经持有它，
+    # 刚开机那 1~2 秒"互斥体已存在、窗口还没出现"正是能被秒解的缝隙
+    try {
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop)) {
+            if (-not $p.CommandLine) { continue }
+            if ($p.CommandLine -notmatch '-Mode\s+lock-ui') { continue }
+            $gp = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+            if ($gp -and $gp.MainWindowHandle -ne 0) { return $true }
+        }
+    } catch { }
+    return $false
 }
 
 function Get-PowerShellExe {
@@ -958,8 +972,8 @@ function Invoke-Unlock {
 
     # 解锁只能作用于看得见的锁：锁机时段内遮罩没在跑（典型是刚开机那几秒），
     # 不写任何解锁状态，直接把遮罩补起来
-    if ((Get-LockWindow -Config $cfg -At $now) -and -not (Test-NamedMutexHeld $script:MutexUI)) {
-        Write-FocusLog 'unlock-refused' '遮罩未运行，改为立即上锁'
+    if ((Get-LockWindow -Config $cfg -At $now) -and -not (Test-LockUiVisible)) {
+        Write-FocusLog 'unlock-refused' '遮罩未显示，改为立即上锁'
         Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
         [void](Start-FocusChild -ChildMode 'lock-ui')
         [void](Start-FocusChild -ChildMode 'guard')
@@ -1471,7 +1485,7 @@ function Invoke-TickCore {
     $gdAlive = Test-NamedMutexHeld $script:MutexGuard
 
     if (-not $gdAlive) { [void](Start-FocusChild -ChildMode 'guard') }
-    if (-not $uiAlive) { [void](Start-FocusChild -ChildMode 'lock') }
+    if (-not $uiAlive) { [void](Start-FocusChild -ChildMode 'lock-ui') }
 }
 
 function Invoke-Tick {
