@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.1.0'
+$script:Version    = '1.2.0'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -955,6 +955,16 @@ function Invoke-Unlock {
 
     # 两个区间只要有交集（并集连通），在并集内任何时刻解锁都同时解除两个
     $set = Get-UnlockSet -Config $cfg -At $now
+
+    # 解锁只能作用于看得见的锁：锁机时段内遮罩没在跑（典型是刚开机那几秒），
+    # 不写任何解锁状态，直接把遮罩补起来
+    if ((Get-LockWindow -Config $cfg -At $now) -and -not (Test-NamedMutexHeld $script:MutexUI)) {
+        Write-FocusLog 'unlock-refused' '遮罩未运行，改为立即上锁'
+        Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
+        [void](Start-FocusChild -ChildMode 'lock-ui')
+        [void](Start-FocusChild -ChildMode 'guard')
+        return
+    }
     if ($set.Manual) {
         Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
         $did += '定时区间'
