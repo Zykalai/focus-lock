@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('lock', 'lock-ui', 'lock-ask', 'tick', 'guard', 'unlock', 'settings')]
+    [ValidateSet('lock', 'lock-ui', 'lock-ask', 'tick', 'guard', 'unlock', 'settings', 'uninstall')]
     [string]$Mode = 'lock',
     [int]$Minutes = 0
 )
@@ -8,25 +8,22 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.0.0'
+$script:Version    = '1.1.0'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
 $script:ManualPath = Join-Path $script:DataDir 'manual.json'
 $script:LogPath    = Join-Path $script:DataDir 'focuslock.log'
 $script:TaskName   = 'FocusLockGuard'
-$script:TaskNameBk = 'FocusLockGuardBackup'
-$script:TaskNameManual = 'FocusLockManualLock'
 $script:MutexUI    = 'Local\FocusLock.UI'
 $script:MutexGuard = 'Local\FocusLock.Guard'
 $script:SelfPath   = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 
 $script:CsSource = @'
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Collections.Generic;
-using System.Diagnostics;
 
 namespace FocusLockNative
 {
@@ -48,17 +45,6 @@ namespace FocusLockNative
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool IsIconic(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        public static extern IntPtr SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
@@ -86,12 +72,11 @@ namespace FocusLockNative
         public delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         private const int WH_KEYBOARD_LL = 13;
+        // 允许的组合：Win+L（用户锁屏去睡觉）
+        private const int VK_L = 0x4C;
         private static IntPtr _hookId = IntPtr.Zero;
         private static LowLevelKeyboardProc _proc;
         private static bool _active = false;
-
-        // 允许的组合：Win+L（用户锁屏去睡觉）
-        private const int VK_L = 0x4C;
 
         public static bool Install()
         {
@@ -136,22 +121,12 @@ namespace FocusLockNative
                 {
                     bool alt = Down(0x12);
                     bool ctrl = Down(0x11);
-                    bool shift = Down(0x10);
                     bool win = Down(0x5B) || Down(0x5C);
 
-                    // Win 键本身
                     if (vk == 0x5B || vk == 0x5C) return (IntPtr)1;
-
-                    // Win 组合（放行 Win+L）
                     if (win && vk != VK_L) return (IntPtr)1;
-
-                    // Alt+Tab / Alt+Esc / Alt+Space
                     if (alt && (vk == 0x09 || vk == 0x1B || vk == 0x20)) return (IntPtr)1;
-
-                    // Alt+F4
                     if (alt && vk == 0x73) return (IntPtr)1;
-
-                    // Ctrl+Esc / Ctrl+Shift+Esc
                     if (ctrl && vk == 0x1B) return (IntPtr)1;
                 }
             }
@@ -162,22 +137,6 @@ namespace FocusLockNative
 '@
 
 
-function Start-FocusChild {
-
-    param([string]$ChildMode, [int]$AutoClose = 0)
-
-    $exe = Get-PowerShellExe
-    $argList = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Sta', '-WindowStyle', 'Hidden', '-File', "`"$($script:SelfPath)`"", '-Mode', $ChildMode)
-    if ($AutoClose -gt 0) { $argList += @('-Seconds', [string]$AutoClose) }
-
-    try {
-        Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden -ErrorAction Stop | Out-Null
-        return $true
-    } catch {
-        Write-FocusLog 'child-start-fail' "$ChildMode : $($_.Exception.Message)"
-        return $false
-    }
-}
 function ConvertTo-IsoDay {
     param([System.DayOfWeek]$DayOfWeek)
     $n = [int]$DayOfWeek
@@ -200,9 +159,38 @@ function Test-NeutralClassName {
 }
 
 function Initialize-Native {
-    if (-not ('FocusLockNative.Win32' -as [type])) {
-        Add-Type -TypeDefinition $script:CsSource -Language CSharp -ErrorAction Stop
+
+    if ('FocusLockNative.Win32' -as [type]) { return $true }
+
+    # 编一次、落盘复用：原来每个 tick 都 Add-Type，等于每分钟拉起一次 csc.exe
+    $sha  = [System.Security.Cryptography.SHA256]::Create()
+    $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($script:CsSource))).Replace('-', '')
+    $sha.Dispose()
+
+    $dll   = Join-Path $script:DataDir 'native.dll'
+    $stamp = Join-Path $script:DataDir 'native.hash'
+
+    if ((Test-Path -LiteralPath $dll) -and (Test-Path -LiteralPath $stamp)) {
+        try {
+            if (([System.IO.File]::ReadAllText($stamp)).Trim() -eq $hash) {
+                Add-Type -Path $dll -ErrorAction Stop
+                return $true
+            }
+        } catch { }
     }
+
+    if (Test-Path -LiteralPath $script:DataDir) {
+        try {
+            Add-Type -TypeDefinition $script:CsSource -Language CSharp -OutputAssembly $dll -OutputType Library -ErrorAction Stop
+            [System.IO.File]::WriteAllText($stamp, $hash, (New-Object System.Text.UTF8Encoding($true)))
+            Add-Type -Path $dll -ErrorAction Stop
+            return $true
+        } catch {
+            Write-FocusLog 'native-build-fail' $_.Exception.Message
+        }
+    }
+
+    try { Add-Type -TypeDefinition $script:CsSource -Language CSharp -ErrorAction Stop; return $true } catch { return $false }
 }
 
 function Write-FocusLog {
@@ -238,21 +226,6 @@ function Save-FocusConfig {
     [System.IO.File]::WriteAllText($script:ConfigPath, $json, (New-Object System.Text.UTF8Encoding($true)))
 }
 
-function Get-FocusState {
-    if (-not (Test-Path $script:StatePath)) { return $null }
-    try {
-        $raw = [System.IO.File]::ReadAllText($script:StatePath, [System.Text.Encoding]::UTF8)
-        return ($raw | ConvertFrom-Json)
-    } catch { return $null }
-}
-
-function Save-FocusState {
-    param([object]$State)
-    if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
-    $json = $State | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($script:StatePath, $json, (New-Object System.Text.UTF8Encoding($true)))
-}
-
 function Clear-FocusState {
     if (Test-Path $script:StatePath) { Remove-Item -LiteralPath $script:StatePath -Force -ErrorAction SilentlyContinue }
 }
@@ -281,11 +254,10 @@ function Get-PowerShellExe {
 
 function Start-FocusChild {
 
-    param([string]$ChildMode, [int]$AutoClose = 0)
+    param([string]$ChildMode)
 
     $exe = Get-PowerShellExe
     $argStr = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Sta -File "{0}" -Mode {1}' -f $script:SelfPath, $ChildMode
-    if ($AutoClose -gt 0) { $argStr += ' -Seconds ' + $AutoClose }
 
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -388,6 +360,7 @@ function New-ManualLock {
 
 function Set-Dismissed {
     param([string]$Key)
+    if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
     $obj = [pscustomobject]@{ dismissed = $Key; at = (Get-Date).ToString('o') }
     [System.IO.File]::WriteAllText($script:StatePath, ($obj | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($true)))
 }
@@ -493,39 +466,6 @@ function Get-LockWindow {
         if ($w.End -gt $pick.End) { $pick = $w }
     }
     return $pick
-}
-
-function Test-ReleaseActive {
-    param([object]$Config, [datetime]$At = (Get-Date))
-    return $false
-}
-
-function Test-AllowedProcess {
-    param([object]$Config, [object]$Process)
-
-    if (-not $Process) { return $false }
-
-    $names = @()
-    if ($Config.allow.processNames) { $names = @($Config.allow.processNames) }
-    $name = $Process.ProcessName
-    foreach ($kw in $names) {
-        if (-not $kw) { continue }
-        if ($name -like "*$kw*") { return $true }
-    }
-
-    $kws = @()
-    if ($Config.allow.pathKeywords) { $kws = @($Config.allow.pathKeywords) }
-    try {
-        $path = $Process.Path
-        if ($path) {
-            $lp = $path.ToLowerInvariant()
-            foreach ($kw in $kws) {
-                if (-not $kw) { continue }
-                if ($lp.Contains($kw.ToLowerInvariant())) { return $true }
-            }
-        }
-    } catch { }
-    return $false
 }
 
 $script:FgCachedPid   = 0
@@ -736,7 +676,7 @@ function Set-TaskbarHidden {
         }
 
         # unlock 模式下不会预先 Initialize-Native，这里自己补上
-        if (-not ('FocusLockNative.Win32' -as [type])) { Initialize-Native }
+        if (-not ('FocusLockNative.Win32' -as [type])) { [void](Initialize-Native) }
         if (-not ('FocusLockNative.Win32' -as [type])) { return }
         $sw = 0
         if (-not $Hidden) { $sw = 5 }
@@ -826,17 +766,6 @@ function New-DefaultConfig {
     }
 }
 
-function Get-LauncherPath {
-
-    $vbs = Join-Path $script:DataDir 'tick.vbs'
-    if (Test-Path -LiteralPath $vbs) { return $vbs }
-    if ($script:SelfPath) {
-        $vbs2 = Join-Path (Split-Path -Parent $script:SelfPath) 'tick.vbs'
-        if ($vbs2 -and (Test-Path -LiteralPath $vbs2)) { return $vbs2 }
-    }
-    return $null
-}
-
 function Get-WScriptExe {
     foreach ($c in @("$env:SystemRoot\System32\wscript.exe", 'C:\Windows\System32\wscript.exe')) {
         if (Test-Path -LiteralPath $c) { return $c }
@@ -846,27 +775,27 @@ function Get-WScriptExe {
 
 function Set-AutostartEntry {
 
+    # Run 键是「登录即触发」的那一路：Explorer 一起来就执行，不受任务计划节流影响
     param([bool]$Enable)
+
     $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     try {
-        if ($Enable) {
-            if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
-
-            $vbs = Get-LauncherPath
-            if ($vbs -and (Test-Path -LiteralPath $vbs)) {
-
-                $value = '"{0}" "{1}"' -f (Get-WScriptExe), $vbs
-            } else {
-                $exe = Get-PowerShellExe
-                $scriptPath = Join-Path $script:DataDir 'FocusLock.ps1'
-                $value = '"{0}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File "{1}" -Mode tick' -f $exe, $scriptPath
-            }
-            New-ItemProperty -Path $runKey -Name 'FocusLock' -Value $value -PropertyType String -Force | Out-Null
-        } else {
-            if (Test-Path $runKey) {
-                Remove-ItemProperty -Path $runKey -Name 'FocusLock' -Force -ErrorAction SilentlyContinue
-            }
+        if (-not $Enable) {
+            Remove-ItemProperty -Path $runKey -Name 'FocusLock' -Force -ErrorAction SilentlyContinue
+            return
         }
+        if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
+
+        $vbs = Join-Path $script:DataDir 'tick.vbs'
+        if (Test-Path -LiteralPath $vbs) {
+            $value = '"{0}" "{1}"' -f (Get-WScriptExe), $vbs
+        } else {
+            $value = '"{0}" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File "{1}" -Mode tick' -f (Get-PowerShellExe), (Join-Path $script:DataDir 'FocusLock.ps1')
+        }
+        New-ItemProperty -Path $runKey -Name 'FocusLock' -Value $value -PropertyType String -Force | Out-Null
+
+        # 清掉启动应用里的禁用记录，否则 Windows 会跳过这个 Run 键
+        try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'FocusLock' -Force -ErrorAction SilentlyContinue } catch { }
     } catch {
         Write-FocusLog 'autostart-fail' $_.Exception.Message
     }
@@ -874,30 +803,21 @@ function Set-AutostartEntry {
 
 function Register-FocusTasks {
 
+    # Run 键 + 计划任务两条都要：Run 键负责"登录那一刻"，任务负责每分钟轮询和兜底
     $vbsMain = Join-Path $script:DataDir 'tick.vbs'
 
-    function New-TaskActionFor {
-        param([string]$VbsPath)
-        if ($VbsPath -and (Test-Path -LiteralPath $VbsPath)) {
-            return (New-ScheduledTaskAction -Execute (Get-WScriptExe) -Argument ('"{0}"' -f $VbsPath))
-        }
-        $exe = Get-PowerShellExe
+    if (Test-Path -LiteralPath $vbsMain) {
+        $action = New-ScheduledTaskAction -Execute (Get-WScriptExe) -Argument ('"{0}"' -f $vbsMain)
+    } else {
         $sp = Join-Path $script:DataDir 'FocusLock.ps1'
-        $arg = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Sta -File "{0}" -Mode tick' -f $sp
-        return (New-ScheduledTaskAction -Execute $exe -Argument $arg)
+        $action = New-ScheduledTaskAction -Execute (Get-PowerShellExe) -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Mode tick' -f $sp)
     }
 
-    $action = New-TaskActionFor -VbsPath $vbsMain
     $user = "$env:USERDOMAIN\$env:USERNAME"
 
     $triggers = @()
     try { $triggers += New-ScheduledTaskTrigger -AtLogOn -User $user } catch { $triggers += New-ScheduledTaskTrigger -AtLogOn }
-
-    $interval1 = New-TimeSpan -Minutes 1
-    $interval2 = New-TimeSpan -Minutes 10
-    $duration = New-TimeSpan -Days 3650
-
-    $triggers += New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval $interval1 -RepetitionDuration $duration
+    $triggers += New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
 
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -Priority 10
     $settings.Hidden = $true
@@ -1037,7 +957,6 @@ function Invoke-Unlock {
     $set = Get-UnlockSet -Config $cfg -At $now
     if ($set.Manual) {
         Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
-        try { Unregister-ScheduledTask -TaskName $script:TaskNameManual -Confirm:$false -ErrorAction SilentlyContinue } catch { }
         $did += '定时区间'
     }
     if ($set.Auto -and $set.AutoWin) {
@@ -1048,9 +967,12 @@ function Invoke-Unlock {
         Write-FocusLog 'unlock-cli' (($did -join ' + ') + ' 已解除')
         Write-Host (($did -join '、') + ' 已解除。') -ForegroundColor Green
     } else {
-        Remove-Item -LiteralPath $script:StatePath -Force -ErrorAction SilentlyContinue
+        Clear-FocusState
         Write-Host '当前不在锁定状态。' -ForegroundColor DarkGray
     }
+
+    # 先清策略：Stop-Process -Force 不会执行 finally，策略值只能在这里兜底
+    Set-TaskMgrBlocked -Blocked $false
 
     # 连续多轮清理：guard 可能在几百毫秒内抢着拉起新的锁屏，单次杀不干净
     for ($i = 0; $i -lt 5; $i++) {
@@ -1067,23 +989,52 @@ function Invoke-Unlock {
     Write-FocusLog 'unlock-done' ''
 }
 
-function Ensure-Setup {
 
-    $need = $false
-    $t = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-    if (-not $t) { $need = $true }
-    $run = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name FocusLock -ErrorAction SilentlyContinue).FocusLock
-    if (-not $run) { $need = $true }
+# ---- 设置 / 选时长两个对话框共用的绘图助手（原来各自复制了一份） ----
+function Px { param([double]$v) return [int]($v * $script:DlgScale) }
 
-    if (-not $need) { return }
+function P-Region {
+    param($W, $H, $R)
+    $d = $R * 2
+    if ($d -gt $W) { $d = $W }
+    if ($d -gt $H) { $d = $H }
+    $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $p.AddArc(0, 0, $d, $d, 180, 90)
+    $p.AddArc($W - $d - 1, 0, $d, $d, 270, 90)
+    $p.AddArc($W - $d - 1, $H - $d - 1, $d, $d, 0, 90)
+    $p.AddArc(0, $H - $d - 1, $d, $d, 90, 90)
+    $p.CloseFigure()
+    return (New-Object System.Drawing.Region($p))
+}
 
-    try {
-        Set-AutostartEntry -Enable $true
-        Register-FocusTasks
-        Write-FocusLog 'setup' ''
-    } catch {
-        Write-FocusLog 'setup-fail' $_.Exception.Message
-    }
+function P-Label {
+    param($T, $Size, $Color, $Bold = $false)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $T
+    $l.AutoSize = $true
+    $l.ForeColor = $Color
+    $l.BackColor = [System.Drawing.Color]::Transparent
+    $st = [System.Drawing.FontStyle]::Regular
+    if ($Bold) { $st = [System.Drawing.FontStyle]::Bold }
+    try { $l.Font = New-Object System.Drawing.Font('幼圆', $Size, $st) } catch { }
+    return $l
+}
+
+function P-Btn {
+    param($T, $W, $H, $Back, $Fore, $Size)
+    $w = Px $W
+    $h = Px $H
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $T
+    $b.Size = New-Object System.Drawing.Size($w, $h)
+    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $b.FlatAppearance.BorderSize = 0
+    $b.BackColor = $Back
+    $b.ForeColor = $Fore
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    try { $b.Font = New-Object System.Drawing.Font('幼圆', $Size, [System.Drawing.FontStyle]::Bold) } catch { }
+    try { $b.Region = P-Region $w $h (Px 12) } catch { }
+    return $b
 }
 
 function Invoke-Settings {
@@ -1097,7 +1048,7 @@ function Invoke-Settings {
         if ($ap) { $S = [double]$ap / 96.0 }
     } catch { }
     if ($S -lt 1.0) { $S = 1.0 }
-    function Px { param([double]$v) return [int]($v * $S) }
+    $script:DlgScale = $S
 
     $C = @{
         Bg     = [System.Drawing.Color]::FromArgb(255, 246, 236)
@@ -1110,49 +1061,6 @@ function Invoke-Settings {
         Input  = [System.Drawing.Color]::FromArgb(243, 238, 255)
     }
 
-    function P-Region {
-        param($W, $H, $R)
-        $d = $R * 2
-        if ($d -gt $W) { $d = $W }
-        if ($d -gt $H) { $d = $H }
-        $p = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $p.AddArc(0, 0, $d, $d, 180, 90)
-        $p.AddArc($W - $d - 1, 0, $d, $d, 270, 90)
-        $p.AddArc($W - $d - 1, $H - $d - 1, $d, $d, 0, 90)
-        $p.AddArc(0, $H - $d - 1, $d, $d, 90, 90)
-        $p.CloseFigure()
-        return (New-Object System.Drawing.Region($p))
-    }
-
-    function P-Label {
-        param($T, $Size, $Color, $Bold = $false)
-        $l = New-Object System.Windows.Forms.Label
-        $l.Text = $T
-        $l.AutoSize = $true
-        $l.ForeColor = $Color
-        $l.BackColor = [System.Drawing.Color]::Transparent
-        $st = [System.Drawing.FontStyle]::Regular
-        if ($Bold) { $st = [System.Drawing.FontStyle]::Bold }
-        try { $l.Font = New-Object System.Drawing.Font('幼圆', $Size, $st) } catch { }
-        return $l
-    }
-
-    function P-Btn {
-        param($T, $W, $H, $Back, $Fore, $Size)
-        $w = Px $W
-        $h = Px $H
-        $b = New-Object System.Windows.Forms.Button
-        $b.Text = $T
-        $b.Size = New-Object System.Drawing.Size($w, $h)
-        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-        $b.FlatAppearance.BorderSize = 0
-        $b.BackColor = $Back
-        $b.ForeColor = $Fore
-        $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-        try { $b.Font = New-Object System.Drawing.Font('幼圆', $Size, [System.Drawing.FontStyle]::Bold) } catch { }
-        try { $b.Region = P-Region $w $h (Px 12) } catch { }
-        return $b
-    }
 
     $cfg = Get-FocusConfig
     if (-not $cfg) {
@@ -1340,7 +1248,7 @@ function Get-NextBoundary {
     }
 
     # 2) 熬夜锁：把未来两天的窗口边界都算出来
-    if ($Config -and $Config.autoEnabled -eq $true) {
+    if ($Config -and $Config.autoEnabled -ne $false) {
         $startTs = ConvertTo-TimeOfDay $Config.window.start
         $endTs   = ConvertTo-TimeOfDay $Config.window.end
         if ($null -ne $startTs -and $null -ne $endTs -and $startTs -ne $endTs) {
@@ -1378,7 +1286,7 @@ function Invoke-LockAsk {
         if ($ap) { $S = [double]$ap / 96.0 }
     } catch { }
     if ($S -lt 1.0) { $S = 1.0 }
-    function Px { param([double]$v) return [int]($v * $S) }
+    $script:DlgScale = $S
 
     $C = @{
         Bg     = [System.Drawing.Color]::FromArgb(255, 246, 236)
@@ -1388,49 +1296,6 @@ function Invoke-LockAsk {
         Accent = [System.Drawing.Color]::FromArgb(255, 138, 173)
     }
 
-    function P-Region {
-        param($W, $H, $R)
-        $d = $R * 2
-        if ($d -gt $W) { $d = $W }
-        if ($d -gt $H) { $d = $H }
-        $p = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $p.AddArc(0, 0, $d, $d, 180, 90)
-        $p.AddArc($W - $d - 1, 0, $d, $d, 270, 90)
-        $p.AddArc($W - $d - 1, $H - $d - 1, $d, $d, 0, 90)
-        $p.AddArc(0, $H - $d - 1, $d, $d, 90, 90)
-        $p.CloseFigure()
-        return (New-Object System.Drawing.Region($p))
-    }
-
-    function P-Label {
-        param($T, $Size, $Color, $Bold = $false)
-        $l = New-Object System.Windows.Forms.Label
-        $l.Text = $T
-        $l.AutoSize = $true
-        $l.ForeColor = $Color
-        $l.BackColor = [System.Drawing.Color]::Transparent
-        $st = [System.Drawing.FontStyle]::Regular
-        if ($Bold) { $st = [System.Drawing.FontStyle]::Bold }
-        try { $l.Font = New-Object System.Drawing.Font('幼圆', $Size, $st) } catch { }
-        return $l
-    }
-
-    function P-Btn {
-        param($T, $W, $H, $Back, $Fore, $Size)
-        $w = Px $W
-        $h = Px $H
-        $b = New-Object System.Windows.Forms.Button
-        $b.Text = $T
-        $b.Size = New-Object System.Drawing.Size($w, $h)
-        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-        $b.FlatAppearance.BorderSize = 0
-        $b.BackColor = $Back
-        $b.ForeColor = $Fore
-        $b.Cursor = [System.Windows.Forms.Cursors]::Hand
-        try { $b.Font = New-Object System.Drawing.Font('幼圆', $Size, [System.Drawing.FontStyle]::Bold) } catch { }
-        try { $b.Region = P-Region $w $h (Px 12) } catch { }
-        return $b
-    }
 
     $picked = 0
 
@@ -1555,7 +1420,7 @@ function Invoke-LockAsk {
         [void](Start-FocusChild -ChildMode 'guard')
     }
 }
-function Invoke-Tick {
+function Invoke-TickCore {
 
     $cfg = Get-FocusConfig
     if (-not $cfg) { return }
@@ -1577,37 +1442,36 @@ function Invoke-Tick {
     }
 
     if (-not $win) {
-
-        $uiAlive = Test-NamedMutexHeld $script:MutexUI
-        if (-not $uiAlive) {
+        # 解锁态：只有确实留下痕迹时才去恢复，不再每个 tick 都加载 native
+        if (-not (Test-NamedMutexHeld $script:MutexUI)) {
             $pol = $null
             try { $pol = (Get-ItemProperty -Path $script:PolicyKey -Name 'DisableTaskMgr' -ErrorAction Stop).DisableTaskMgr } catch { }
             if ($pol -eq 1) { Set-TaskMgrBlocked -Blocked $false }
 
-            # 没有遮罩就没有理由藏任务栏：不看标记文件，直接检查实际可见性
-            Initialize-Native
-            $tbLost = $false
-            foreach ($cls in @('Shell_TrayWnd', 'Shell_SecondaryTrayWnd')) {
-                $h = [FocusLockNative.Win32]::FindWindow($cls, $null)
-                if ($h -ne [IntPtr]::Zero -and -not [FocusLockNative.Win32]::IsWindowVisible($h)) { $tbLost = $true }
-            }
-            if ($tbLost) {
-                Set-TaskbarHidden -Hidden $false
-                Write-FocusLog 'taskbar-restored' '检测到任务栏被藏，已恢复'
-            }
             $tbFlag = Join-Path $script:DataDir 'taskbar.hidden'
-            if (Test-Path $tbFlag) { Remove-Item -LiteralPath $tbFlag -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $tbFlag) {
+                Set-TaskbarHidden -Hidden $false
+                Write-FocusLog 'taskbar-restored' ''
+            }
         }
         return
     }
-
-    if (Test-ReleaseActive -Config $cfg -At $now) { return }
 
     $uiAlive = Test-NamedMutexHeld $script:MutexUI
     $gdAlive = Test-NamedMutexHeld $script:MutexGuard
 
     if (-not $gdAlive) { [void](Start-FocusChild -ChildMode 'guard') }
     if (-not $uiAlive) { [void](Start-FocusChild -ChildMode 'lock') }
+}
+
+function Invoke-Tick {
+    # 超过 800ms 才记一笔，方便下次排查开机/唤醒时的卡顿
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { Invoke-TickCore } finally {
+        if ($sw.ElapsedMilliseconds -gt 800) {
+            Write-FocusLog 'tick-slow' ("{0} ms" -f $sw.ElapsedMilliseconds)
+        }
+    }
 }
 
 function Invoke-Guard {
@@ -1632,7 +1496,6 @@ function Invoke-Guard {
 
             $win = Get-LockWindow -Config $cfg -At $now
             if (-not $win) { break }
-            if (Test-ReleaseActive -Config $cfg -At $now) { break }
 
             $maxH = 10
             if ($cfg.safety -and $cfg.safety.maxLockHours) { $maxH = [double]$cfg.safety.maxLockHours }
@@ -1761,9 +1624,9 @@ function Confirm-Shutdown {
     return ([string]$dlg.Tag -eq 'yes')
 }
 function Invoke-LockUI {
-    param([object]$Config, [switch]$Preview, [int]$PreviewSeconds = 0)
+    param([object]$Config)
 
-    Initialize-Native
+    [void](Initialize-Native)
     try { [void][FocusLockNative.Win32]::SetProcessDPIAware() } catch { }
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -1772,7 +1635,7 @@ function Invoke-LockUI {
 
     $createdNew = $false
     $mutex = [System.Threading.Mutex]::new($false, $script:MutexUI, [ref]$createdNew)
-    if (-not $createdNew -and -not $Preview) {
+    if (-not $createdNew) {
         try { $mutex.Dispose() } catch { }
         return
     }
@@ -1800,7 +1663,6 @@ function Invoke-LockUI {
     $script:CH = @{
         Data    = New-DigitChallenge -Groups $cg -PerGroup $pg
         Index   = 0
-        Failed  = 0
         Locked  = $false
         Message = ''
     }
@@ -1931,7 +1793,6 @@ function Invoke-LockUI {
     $btnDoubao = New-RoundButton -Text '打开豆包' -W 200 -H 46 -Back $C.Accent -Fore ([System.Drawing.Color]::White) -FontSize 13
     $btnShutdown = New-RoundButton -Text '立刻关机' -W 200 -H 46 -Back ([System.Drawing.Color]::FromArgb(62, 68, 86)) -Fore ([System.Drawing.Color]::FromArgb(176, 176, 186)) -FontSize 13
     $btnSubmit = New-RoundButton -Text '确认' -W 108 -H 44 -Back $C.Accent2 -Fore ([System.Drawing.Color]::White) -FontSize 13
-    $script:ShutdownArmed = $false
 
     $codeBox = New-InputBox -W 340 -H 50 -FontSize 17
     $txtCode = $codeBox.Text
@@ -2038,7 +1899,6 @@ function Invoke-LockUI {
         }
 
         if ($val -cne $script:CH.Current) {
-            $script:CH.Failed++
             Reset-Challenge
             return
         }
@@ -2058,7 +1918,6 @@ function Invoke-LockUI {
             $setU = Get-UnlockSet -Config $Config -At $nowU
             if ($setU.Manual) {
                 Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
-                try { Unregister-ScheduledTask -TaskName $script:TaskNameManual -Confirm:$false -ErrorAction SilentlyContinue } catch { }
                 Write-FocusLog 'manual-released' '定时区间已移除'
             }
             if ($setU.Auto -and $setU.AutoWin) {
@@ -2083,7 +1942,6 @@ function Invoke-LockUI {
     $script:DoubaoTries = 0
 
     function Update-MaskState {
-        if ($Preview) { return }
 
         $now = Get-Date
         $info = Get-ForegroundInfo
@@ -2120,7 +1978,6 @@ function Invoke-LockUI {
     }
 
     $script:TickCount = 0
-    $script:StartedAt = Get-Date
     $script:CfgNow = $Config
     $script:CfgAt = Get-Date
     $script:LastClockText = ''
@@ -2167,7 +2024,6 @@ function Invoke-LockUI {
 
             # 底栏跟着当前生效区间的终点走，不再固定显示熬夜锁配置的结束时间
             $footerText = ('FocusLock v{0}　·　{1} 自动解锁　·　也可运行 Unlock.cmd 立即解锁' -f $script:Version, $footerTime)
-            if ($Preview) { $footerText = '【预览模式】' + $footerText }
             if ($script:LastFooterText -ne $footerText) {
                 $script:LastFooterText = $footerText
                 try { $lblFooter.Text = $footerText } catch { }
@@ -2183,15 +2039,6 @@ function Invoke-LockUI {
 
         if ($needLayout) { Layout-OnCard }
 
-        if ($Preview) {
-            $elapsed = ($now - $script:StartedAt).TotalSeconds
-            if ($PreviewSeconds -gt 0 -and $elapsed -ge $PreviewSeconds) {
-                $script:AllowClose = $true
-                $form.Close()
-                return
-            }
-            return
-        }
 
         Update-MaskState
 
@@ -2214,13 +2061,9 @@ function Invoke-LockUI {
         }
 
         if ($script:TickCount % 25 -eq 0) {
-            $forced = $false
-            if (-not $forced) {
                 if (-not $cfgNow) { $script:AllowClose = $true; $form.Close(); return }
                 $winNow = Get-LockWindow -Config $cfgNow -At $now
                 if (-not $winNow) { $script:AllowClose = $true; $form.Close(); return }
-                if (Test-ReleaseActive -Config $cfgNow -At $now) { $script:AllowClose = $true; $form.Close(); return }
-            }
         }
 
         if ($script:TickCount % 40 -eq 0) {
@@ -2239,7 +2082,7 @@ function Invoke-LockUI {
 
         if ($script:TickCount % 120 -eq 5) {
             Set-TaskMgrBlocked -Blocked $true
-            if ($script:MaskVisible -and -not $Preview) {
+            if ($script:MaskVisible) {
                 Set-TaskbarHidden -Hidden $true
                 $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
                 if ($form.Bounds.Width -ne $b.Width -or $form.Bounds.Height -ne $b.Height) {
@@ -2320,12 +2163,6 @@ function Invoke-LockUI {
         Layout-Screen
         Update-ChallengeText
         $timer.Start()
-        if (-not $Preview) {
-
-            try { [void][FocusLockNative.Win32]::Install() } catch { }
-            Set-TaskMgrBlocked -Blocked $true
-            Set-TaskbarHidden -Hidden $true
-        }
         try { $form.Activate() } catch { }
         try { [void][FocusLockNative.Win32]::SetForegroundWindow($form.Handle) } catch { }
     })
@@ -2334,39 +2171,65 @@ function Invoke-LockUI {
 
     # 底栏由 timer 动态刷新（显示当前实际生效区间的终点），这里只放个初值
     $lblFooter.Text = ('FocusLock v{0}　·　也可运行 Unlock.cmd 立即解锁' -f $script:Version)
-    if ($Preview) { $lblFooter.Text = '【预览模式 · 无任何实际限制】' + $lblFooter.Text }
 
-    Write-FocusLog 'lock-ui-start' "preview=$($Preview.IsPresent)"
+    Write-FocusLog 'lock-ui-start' ''
 
     try {
         [System.Windows.Forms.Application]::Run($form)
     } finally {
         try { $timer.Stop(); $timer.Dispose() } catch { }
         try { Set-TaskbarHidden -Hidden $false } catch { }
-        if (-not $Preview) {
             try { [FocusLockNative.Win32]::Uninstall() } catch { }
             try { Set-TaskMgrBlocked -Blocked $false } catch { }
-        }
         try { $mutex.Dispose() } catch { }
 
-        if ($script:PendingRelease) {
-            $cfgNow = Get-FocusConfig
-            $nowB = Get-Date
-            $setB = Get-UnlockSet -Config $cfgNow -At $nowB
-            if ($setB.Manual) {
-                Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
-                Clear-FocusState
-                try { Unregister-ScheduledTask -TaskName $script:TaskNameManual -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-                Write-FocusLog 'manual-released' '定时区间已移除'
-            }
-            if ($setB.Auto -and $setB.AutoWin) {
-                Set-Dismissed -Key $setB.AutoWin.Key
-                Write-FocusLog 'dismissed' $setB.AutoWin.Key
-            }
-        }
-        Write-FocusLog 'lock-ui-exit' "preview=$($Preview.IsPresent)"
+        Write-FocusLog 'lock-ui-exit' ''
         try { $form.Dispose() } catch { }
     }
+}
+
+function Invoke-Uninstall {
+
+    # 清掉程序自己留下的全部痕迹；目录本身由 uninstall.cmd 在本进程退出后删除
+    $me = $PID
+
+    foreach ($n in @($script:TaskName, 'FocusLockGuardBackup', 'FocusLockManualLock')) {
+        try { Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    }
+
+    # 杀掉还在跑的 tick / guard / 遮罩；不杀自己
+    try {
+        $pat = [regex]::Escape($script:DataDir)
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' or Name='wscript.exe'" -ErrorAction SilentlyContinue)) {
+            if ($p.ProcessId -eq $me) { continue }
+            if ($p.CommandLine -and ($p.CommandLine -match $pat)) {
+                try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+    } catch { }
+    Start-Sleep -Milliseconds 400
+
+    # DisableTaskMgr + 空壳策略键
+    Set-TaskMgrBlocked -Blocked $false
+    try {
+        $k = $script:PolicyKey
+        if (Test-Path $k) {
+            $vals = @((Get-ItemProperty $k).PSObject.Properties.Name | Where-Object { $_ -notlike 'PS*' })
+            $subs = @(Get-ChildItem $k -ErrorAction SilentlyContinue)
+            if ($vals.Count -eq 0 -and $subs.Count -eq 0) { Remove-Item $k -Force -ErrorAction SilentlyContinue }
+        }
+    } catch { }
+
+    # 自启：Run 键 + “启动应用”记录
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $appKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+    try { Remove-ItemProperty -Path $runKey -Name 'FocusLock' -Force -ErrorAction SilentlyContinue } catch { }
+    try { Remove-ItemProperty -Path $appKey -Name 'FocusLock' -Force -ErrorAction SilentlyContinue } catch { }
+
+    # v1 遗留
+    try { Remove-Item -LiteralPath 'HKCU:\Software\FocusLock' -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+
+    Set-TaskbarHidden -Hidden $false
 }
 
 switch ($Mode) {
@@ -2378,8 +2241,15 @@ switch ($Mode) {
             Save-FocusConfig -Config $cfgNow
         }
         if ($Minutes -gt 0) { [void](New-ManualLock -Minutes $Minutes) }
-        [void](Ensure-Setup)
-        if (-not (Test-NamedMutexHeld $script:MutexUI)) {
+
+        # 每次上锁都把任务和 Run 键对齐一遍，保证登录秒锁
+        $ok = $true
+        try { Register-FocusTasks; Write-FocusLog 'setup' '' } catch { Write-FocusLog 'setup-fail' $_.Exception.Message; $ok = $false }
+        if (-not $ok) { exit 1 }
+        [void](Initialize-Native)
+
+        # 不在锁定时段就只做部署，不再拉起遮罩空转 6 秒
+        if ((Get-LockWindow -Config $cfgNow -At (Get-Date)) -and -not (Test-NamedMutexHeld $script:MutexUI)) {
             [void](Start-FocusChild -ChildMode 'lock-ui')
             [void](Start-FocusChild -ChildMode 'guard')
         }
@@ -2395,6 +2265,7 @@ switch ($Mode) {
     }
 
     'unlock' { Invoke-Unlock }
+    'uninstall' { Invoke-Uninstall }
     'tick'     { Invoke-Tick }
     'settings' { Invoke-Settings }
     'guard'  { Invoke-Guard }

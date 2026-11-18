@@ -4,6 +4,8 @@ state.json
 manual.json
 focuslock.log
 taskbar.hidden
+native.dll
+native.hash
 
 # 构建产物
 build/
