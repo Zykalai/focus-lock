@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.3'
+$script:Version    = '1.2.4'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -243,19 +243,7 @@ function Test-NamedMutexHeld {
         if ($m) { try { $m.Dispose() } catch { } }
     }
 }
-function Get-UptimeSeconds {
 
-    # 开机多久了。开机头一分钟是固定空窗期：tick、遮罩、guard 都还没起来。
-    # 注意 PS 5.1 的 .NET Framework 没有 Environment::TickCount64（取到 $null），
-    # 所以必须有 WMI 回退，否则会算出 0 秒、永远解不开
-    try {
-        $ms = [Environment]::TickCount64
-        if ($ms) { return ($ms / 1000) }
-    } catch { }
-    try {
-        return ((Get-Date) - (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime).TotalSeconds
-    } catch { return 999999 }
-}
 
 function Set-LockUiReady {
 
@@ -272,23 +260,20 @@ function Clear-LockUiReady {
 
 function Get-LockUiReadyAt {
 
-    # 返回"当前这一轮 lock-ui 真正显示出来的时刻"；没有可信记录就返回 $null
+    # 读 lock-ui 在 Form.Shown 里写下的记录。pid 必须还活着，时间戳必须晚于该进程启动
+    # （否则就是上一轮留下的旧记录，或者 PID 被别的进程复用）
     $readyFile = Join-Path $script:DataDir 'ui-ready.json'
     if (-not (Test-Path -LiteralPath $readyFile)) { return $null }
     try {
-        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop)) {
-            if (-not $p.CommandLine) { continue }
-            if ($p.CommandLine -notmatch '-Mode\s+lock-ui') { continue }
-            $gp = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
-            if (-not $gp) { continue }
-            $u = Get-Content -LiteralPath $readyFile -Raw -ErrorAction Stop | ConvertFrom-Json
-            if ([int]$u.pid -ne [int]$p.ProcessId) { continue }
-            $at = [datetime]$u.at
-            if ($at -lt $gp.StartTime) { continue }   # PID 复用留下的旧记录不算数
-            return $at
-        }
-    } catch { }
-    return $null
+        $u = Get-Content -LiteralPath $readyFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $gp = Get-Process -Id ([int]$u.pid) -ErrorAction SilentlyContinue
+        if (-not $gp) { return $null }
+        $at = [datetime]$u.at
+        if ($at -lt $gp.StartTime) { return $null }
+        return $at
+    } catch {
+        return $null
+    }
 }
 
 function Get-PowerShellExe {
@@ -1004,15 +989,13 @@ function Invoke-Unlock {
     # 两个区间只要有交集（并集连通），在并集内任何时刻解锁都同时解除两个
     $set = Get-UnlockSet -Config $cfg -At $now
 
-    # 解锁只认"看得见的锁"，两条同时满足才放行：
-    #   ① 开机满 60 秒——开机头几十秒 tick / 遮罩 / guard 都还没起来，这是固定空窗
-    #   ② 遮罩的显示时刻早于这次点击——点得比遮罩还早，说明是在缝隙里抢跑，不写解锁状态
+    # 解锁只认"看得见的锁"：遮罩的显示时刻必须早于这次双击。
+    # 点得比遮罩早（开机那几秒、遮罩崩掉重启的空窗）都算抢跑，不写解锁状态，直接把遮罩补起来
     if (Get-LockWindow -Config $cfg -At $now) {
         $clickAt = (Get-Process -Id $PID).StartTime
-        $up = Get-UptimeSeconds
         $readyAt = Get-LockUiReadyAt
-        if (($up -lt 60) -or ($null -eq $readyAt) -or ($readyAt -gt $clickAt)) {
-            $detail = '开机 {0:N0}s，遮罩 {1}' -f $up, $(if ($readyAt) { $readyAt.ToString('HH:mm:ss') } else { '无记录' })
+        if (($null -eq $readyAt) -or ($readyAt -gt $clickAt)) {
+            $detail = '遮罩 {0}' -f $(if ($readyAt) { $readyAt.ToString('HH:mm:ss') } else { '无记录' })
             Write-FocusLog 'unlock-refused' $detail
             Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
             [void](Start-FocusChild -ChildMode 'lock-ui')
