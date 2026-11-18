@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.1'
+$script:Version    = '1.2.2'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -17,6 +17,7 @@ $script:LogPath    = Join-Path $script:DataDir 'focuslock.log'
 $script:TaskName   = 'FocusLockGuard'
 $script:MutexUI    = 'Local\FocusLock.UI'
 $script:MutexGuard = 'Local\FocusLock.Guard'
+$script:EventUiReady = 'Local\FocusLock.UIReady'
 $script:SelfPath   = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 
 $script:CsSource = @'
@@ -242,19 +243,20 @@ function Test-NamedMutexHeld {
         if ($m) { try { $m.Dispose() } catch { } }
     }
 }
-function Test-LockUiVisible {
+function Test-LockUiReady {
 
-    # 遮罩是不是真的画出来了。只看互斥体不够：lock-ui 在 Show 之前就已经持有它，
-    # 刚开机那 1~2 秒"互斥体已存在、窗口还没出现"正是能被秒解的缝隙
+    # 互斥体只能证明 lock-ui 进程活着，证明不了窗口画出来没有（互斥体建在 Show 之前）。
+    # 命名事件在 Shown 里才置位，两个都满足才算"遮罩看得见"
+    if (-not (Test-NamedMutexHeld $script:MutexUI)) { return $false }
+    $ev = $null
     try {
-        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop)) {
-            if (-not $p.CommandLine) { continue }
-            if ($p.CommandLine -notmatch '-Mode\s+lock-ui') { continue }
-            $gp = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
-            if ($gp -and $gp.MainWindowHandle -ne 0) { return $true }
-        }
-    } catch { }
-    return $false
+        $ev = [System.Threading.EventWaitHandle]::OpenExisting($script:EventUiReady)
+        return $ev.WaitOne(0)
+    } catch {
+        return $false
+    } finally {
+        if ($ev) { try { $ev.Dispose() } catch { } }
+    }
 }
 
 function Get-PowerShellExe {
@@ -972,7 +974,7 @@ function Invoke-Unlock {
 
     # 解锁只能作用于看得见的锁：锁机时段内遮罩没在跑（典型是刚开机那几秒），
     # 不写任何解锁状态，直接把遮罩补起来
-    if ((Get-LockWindow -Config $cfg -At $now) -and -not (Test-LockUiVisible)) {
+    if ((Get-LockWindow -Config $cfg -At $now) -and -not (Test-LockUiReady)) {
         Write-FocusLog 'unlock-refused' '遮罩未显示，改为立即上锁'
         Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
         [void](Start-FocusChild -ChildMode 'lock-ui')
@@ -1664,6 +1666,13 @@ function Invoke-LockUI {
         return
     }
 
+    # 遮罩真正显示后才置位；进程被杀时句柄自动关闭，事件对象随之消失
+    $uiReady = $null
+    try {
+        $uiReady = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $script:EventUiReady)
+        [void]$uiReady.Reset()
+    } catch { $uiReady = $null }
+
     $C = @{
         Bg      = [System.Drawing.Color]::FromArgb(10, 12, 18)
         Card    = [System.Drawing.Color]::FromArgb(24, 28, 40)
@@ -2189,6 +2198,7 @@ function Invoke-LockUI {
         $timer.Start()
         try { $form.Activate() } catch { }
         try { [void][FocusLockNative.Win32]::SetForegroundWindow($form.Handle) } catch { }
+        try { if ($uiReady) { [void]$uiReady.Set() } } catch { }
     })
 
     $form.Add_Resize({ Layout-Screen })
@@ -2205,6 +2215,7 @@ function Invoke-LockUI {
         try { Set-TaskbarHidden -Hidden $false } catch { }
             try { [FocusLockNative.Win32]::Uninstall() } catch { }
             try { Set-TaskMgrBlocked -Blocked $false } catch { }
+        try { if ($uiReady) { [void]$uiReady.Reset(); $uiReady.Dispose() } } catch { }
         try { $mutex.Dispose() } catch { }
 
         Write-FocusLog 'lock-ui-exit' ''
@@ -2214,7 +2225,15 @@ function Invoke-LockUI {
 
 function Invoke-Uninstall {
 
-    # 清掉程序自己留下的全部痕迹；目录本身由 uninstall.cmd 在本进程退出后删除
+    # 锁机时段内不许卸载（uninstall.cmd 会把退出码 3 当成"拒绝"直接中止）
+    $cfgNow = Get-FocusConfig
+    if ($cfgNow -and (Get-LockWindow -Config $cfgNow -At (Get-Date))) {
+        Write-FocusLog 'uninstall-refused' '锁定中'
+        Write-Host '锁定期间不能卸载，请先在遮罩上解锁。' -ForegroundColor Yellow
+        exit 3
+    }
+
+    # 清掉程序自己留下的所有痕迹；目录本身由 uninstall.cmd 在本进程退出后删除
     $me = $PID
 
     foreach ($n in @($script:TaskName, 'FocusLockGuardBackup', 'FocusLockManualLock')) {

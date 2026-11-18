@@ -15,6 +15,13 @@ set "CLEANER=%~dp0FocusLock.ps1"
 if not exist "%CLEANER%" set "CLEANER=%TARGET%\FocusLock.ps1"
 if exist "%CLEANER%" (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%CLEANER%" -Mode uninstall
+    if errorlevel 3 (
+        echo.
+        echo   [x] Locked now: uninstall is blocked until you unlock.
+        echo.
+        pause
+        exit /b 3
+    )
     if errorlevel 1 (
         echo     warn script clean-up failed, using registry fallback
         call :regcleanup

@@ -25,7 +25,7 @@ install.cmd
 
 ```cmd
 uninstall.cmd
-```
+```> 锁机时段内 `uninstall.cmd` 会直接拒绝：`-Mode uninstall` 返回退出码 3，命令脚本看到 3 就中止，不删任何东西。要先在遮罩上解锁，或等这一轮锁结束。
 
 先调用 `FocusLock.ps1 -Mode uninstall`（优先用仓库里这份，保证是当前版本），它会：
 
