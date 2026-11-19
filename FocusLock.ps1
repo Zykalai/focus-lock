@@ -8,7 +8,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.4'
+$script:Version    = '1.2.6'
+
+# 遮罩要稳定显示这么久才认解锁：刚 Shown 的头几秒窗口还没真正画到屏幕上，
+# 这时候的双击算抢跑（开机那几秒最容易撞上）
+$script:UnlockGraceSeconds = 3
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -989,15 +993,15 @@ function Invoke-Unlock {
     # 两个区间只要有交集（并集连通），在并集内任何时刻解锁都同时解除两个
     $set = Get-UnlockSet -Config $cfg -At $now
 
-    # 解锁只认"看得见的锁"：遮罩的显示时刻必须早于这次双击。
-    # 点得比遮罩早（开机那几秒、遮罩崩掉重启的空窗）都算抢跑，不写解锁状态，直接把遮罩补起来
+    # 解锁只认"看得见、且已经站稳了的锁"：遮罩显示后要稳定 $script:UnlockGraceSeconds 秒才认这次双击。
+    # 三种抢跑一律拒绝——遮罩还没起、遮罩崩掉重启的空窗、刚 Shown 但屏幕还没画出来
     if (Get-LockWindow -Config $cfg -At $now) {
         $clickAt = (Get-Process -Id $PID).StartTime
         $readyAt = Get-LockUiReadyAt
-        if (($null -eq $readyAt) -or ($readyAt -gt $clickAt)) {
-            $detail = '遮罩 {0}' -f $(if ($readyAt) { $readyAt.ToString('HH:mm:ss') } else { '无记录' })
+        if (($null -eq $readyAt) -or ($clickAt -lt $readyAt.AddSeconds($script:UnlockGraceSeconds))) {
+            $detail = if ($readyAt) { '遮罩 {0:HH:mm:ss}，仅 {1:N1} 秒' -f $readyAt, ($clickAt - $readyAt).TotalSeconds } else { '遮罩 无记录' }
             Write-FocusLog 'unlock-refused' $detail
-            Write-Host '正在锁定：遮罩启动后才能解锁。' -ForegroundColor Yellow
+            Write-Host '正在锁定：遮罩稳定显示后才能解锁。' -ForegroundColor Yellow
             [void](Start-FocusChild -ChildMode 'lock-ui')
             [void](Start-FocusChild -ChildMode 'guard')
             return
