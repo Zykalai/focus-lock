@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.5'
+$script:Version    = '1.2.4'
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
@@ -56,10 +56,6 @@ namespace FocusLockNative
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool SetProcessDPIAware();
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, StringBuilder pvParam, uint fWinIni);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
@@ -1675,70 +1671,6 @@ function Confirm-Shutdown {
 
     return ([string]$dlg.Tag -eq 'yes')
 }
-function Get-WallpaperPath {
-
-    # 桌面壁纸路径（用户级可读）。Windows 的"锁屏图"放在
-    # %ProgramData%\Microsoft\Windows\SystemData\S-1-5-18\ReadOnly 下，需要 SYSTEM 权限读不到，
-    # 所以默认拿桌面壁纸；想用别的图可以在 config.ui.backdrop 里指定路径
-    try {
-        $sb = New-Object System.Text.StringBuilder 1024
-        if ([FocusLockNative.Win32]::SystemParametersInfo([uint32]0x0073, [uint32]$sb.Capacity, $sb, [uint32]0)) {
-            $v = $sb.ToString()
-            if ($v -and (Test-Path -LiteralPath $v)) { return $v }
-        }
-    } catch { }
-    try {
-        $v = (Get-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallPaper -ErrorAction Stop).WallPaper
-        if ($v) {
-            $v = [Environment]::ExpandEnvironmentVariables($v)
-            if (Test-Path -LiteralPath $v) { return $v }
-        }
-    } catch { }
-    return $null
-}
-
-function New-LockBackdrop {
-
-    # 壁纸 -> 缩到 1/14 再放大 = 廉价模糊，然后压暗，保证白字可读。
-    # 失败一律返回 $null，调用方退回纯色底，不影响上锁
-    param([string]$Path, [int]$W, [int]$H)
-
-    if (-not $Path) { return $null }
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    if ($W -lt 64 -or $H -lt 64) { return $null }
-
-    $src = $null; $small = $null; $big = $null; $g1 = $null; $g2 = $null
-    try {
-        $src = [System.Drawing.Image]::FromFile($Path)
-        $sw = [Math]::Max(24, [int]($W / 14))
-        $sh = [Math]::Max(14, [int]($H / 14))
-        $small = [System.Drawing.Bitmap]::new($sw, $sh)
-        $g1 = [System.Drawing.Graphics]::FromImage($small)
-        $g1.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
-        $g1.DrawImage($src, 0, 0, $sw, $sh)
-        $g1.Dispose(); $g1 = $null
-
-        $big = [System.Drawing.Bitmap]::new($W, $H)
-        $g2 = [System.Drawing.Graphics]::FromImage($big)
-        $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $g2.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-        $g2.DrawImage($small, 0, 0, $W, $H)
-        $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(175, 8, 10, 16))
-        $g2.FillRectangle($brush, 0, 0, $W, $H)
-        $brush.Dispose()
-        $g2.Dispose(); $g2 = $null
-        return $big
-    } catch {
-        if ($big) { try { $big.Dispose() } catch { } }
-        return $null
-    } finally {
-        if ($g1) { try { $g1.Dispose() } catch { } }
-        if ($g2) { try { $g2.Dispose() } catch { } }
-        if ($small) { try { $small.Dispose() } catch { } }
-        if ($src) { try { $src.Dispose() } catch { } }
-    }
-}
-
 function Invoke-LockUI {
     param([object]$Config)
 
@@ -1796,19 +1728,6 @@ function Invoke-LockUI {
     $form.BackColor = $C.Bg
     $form.ForeColor = $C.Text
     $form.TopMost = $true
-
-    # 底图：config.ui.backdrop 优先，否则用桌面壁纸；都失败就保持纯色
-    $backdrop = $null
-    try {
-        $imgPath = ''
-        if ($Config.ui -and $Config.ui.backdrop) { $imgPath = [string]$Config.ui.backdrop }
-        if (-not $imgPath) { $imgPath = Get-WallpaperPath }
-        $backdrop = New-LockBackdrop -Path $imgPath -W ([int]($wa.Width / 2)) -H ([int]($wa.Height / 2))
-        if ($backdrop) {
-            $form.BackgroundImage = $backdrop
-            $form.BackgroundImageLayout = [System.Windows.Forms.ImageLayout]::Stretch
-        }
-    } catch { $backdrop = $null }
     $form.ShowInTaskbar = $false
     $form.ControlBox = $false
     $form.MaximizeBox = $false
@@ -2114,22 +2033,11 @@ function Invoke-LockUI {
     $script:LastClockText = ''
     $script:LastRemainText = ''
     $script:LastFooterText = ''
-    $script:LastWakeCheck = Get-Date
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 250
     $timer.Add_Tick({
         $script:TickCount++
         $now = Get-Date
-
-        # 息屏/睡眠回来后 timer 会跳一大格：重排、重绘、重新置顶，避免整块黑、任务栏回来
-        if (($now - $script:LastWakeCheck).TotalSeconds -gt 5) {
-            $script:LastWakeCheck = $now
-            try { Set-TaskbarHidden -Hidden $true } catch { }
-            try { $form.Bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds } catch { }
-            try { $form.TopMost = $false; $form.TopMost = $true } catch { }
-            try { $form.Invalidate($true) } catch { }
-        }
-        $script:LastWakeCheck = $now
 
         $needLayout = $false
 
@@ -2325,7 +2233,6 @@ function Invoke-LockUI {
             try { [FocusLockNative.Win32]::Uninstall() } catch { }
             try { Set-TaskMgrBlocked -Blocked $false } catch { }
         try { Clear-LockUiReady } catch { }
-        try { if ($backdrop) { $backdrop.Dispose() } } catch { }
         try { $mutex.Dispose() } catch { }
 
         Write-FocusLog 'lock-ui-exit' ''
