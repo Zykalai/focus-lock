@@ -8,11 +8,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.6'
+$script:Version    = '1.2.7'
 
 # 遮罩要稳定显示这么久才认解锁：刚 Shown 的头几秒窗口还没真正画到屏幕上，
 # 这时候的双击算抢跑（开机那几秒最容易撞上）
-$script:UnlockGraceSeconds = 3
+$script:UnlockGraceSeconds = 10
 $script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
