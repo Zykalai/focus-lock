@@ -73,12 +73,16 @@ uninstall.cmd
 
 ## 锁屏界面
 
-深色全屏，大时钟 + 倒计时，两个按钮：
+全屏卡片式，大时钟 + 倒计时，两个按钮：
+
+- 背板用当前桌面壁纸（模糊 + 压暗）当底图，看着像原生锁屏；壁纸读不到或解码失败就退回纯深色
 
 - **打开豆包** —— 锁定期间唯一放行的应用
 - **立刻关机** —— 二次确认后 `shutdown /s /t 0 /f`
 
 锁定期间藏任务栏、拦 Win 键 / Alt+Tab / Alt+Esc / Alt+F4 / Ctrl+Esc（放行 Win+L）、每 2 秒杀一次任务管理器；解锁瞬间全部还原。
+
+息屏 / 睡醒回来时 timer 会跳一大格，这时强制重排、重绘并重新置顶（顺带再藏一次任务栏），避免唤醒后整块黑、任务栏也回来。
 
 ## 开机自启与性能
 
@@ -118,6 +122,7 @@ Enable-ScheduledTask  -TaskName FocusLockGuard
 - 非管理员账户下，任务管理器靠杀进程拦（`DisableTaskMgr` 策略若不可写会自动降级）
 - 没有防破解；安全模式、任务管理器、直接改 JSON 都能绕过
 - `native.dll` 首次生成时如果 `Add-Type` 失败，会自动退回进程内编译，功能不受影响
+- Windows 的「锁屏壁纸」放在 `%ProgramData%\Microsoft\Windows\SystemData\S-1-5-18\ReadOnly` 下（SYSTEM 权限），用户级读不到，所以遮罩底图默认取**桌面壁纸**；想用别的图就在 `config.json` 里加 `"ui": { "backdrop": "D:\path\pic.jpg" }`
 
 ## 文件
 
