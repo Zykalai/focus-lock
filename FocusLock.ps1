@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.7'
+$script:Version    = '1.2.8'
 
 # 遮罩要稳定显示这么久才认解锁：刚 Shown 的头几秒窗口还没真正画到屏幕上，
 # 这时候的双击算抢跑（开机那几秒最容易撞上）
@@ -18,6 +18,7 @@ $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
 $script:ManualPath = Join-Path $script:DataDir 'manual.json'
 $script:LogPath    = Join-Path $script:DataDir 'focuslock.log'
+$script:UiSpawnPath = Join-Path $script:DataDir 'ui-spawn.json'
 $script:TaskName   = 'FocusLockGuard'
 $script:MutexUI    = 'Local\FocusLock.UI'
 $script:MutexGuard = 'Local\FocusLock.Guard'
@@ -280,6 +281,39 @@ function Get-LockUiReadyAt {
     }
 }
 
+function Get-UiSpawnState {
+
+    # 记录遮罩这次 spawn 的时刻、连续"启动后立刻消失"的次数、以及退避截止时间。
+    # 杀软把遮罩当可疑进程结束掉时，靠它识别"反复被结束"，避免每分钟闪一次
+    $boot = ''
+    try { $boot = (Get-Date).AddMilliseconds(-[Environment]::TickCount).ToString('yyyyMMddHHmm') } catch { }
+    $o = @{ spawnAt = $null; fastDeaths = 0; backoffUntil = $null; bootId = $boot }
+    try {
+        if (Test-Path -LiteralPath $script:UiSpawnPath) {
+            $j = Get-Content -LiteralPath $script:UiSpawnPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            # 换过开机：上一轮会话的计数/退避作废（否则开机的抢跑保护会被历史计数绕过）
+            if ($boot -and $j.bootId -and (([string]$j.bootId) -ne $boot)) { return $o }
+            if ($j.spawnAt) { $o.spawnAt = [datetime]$j.spawnAt }
+            if ($j.fastDeaths) { $o.fastDeaths = [int]$j.fastDeaths }
+            if ($j.backoffUntil) { $o.backoffUntil = [datetime]$j.backoffUntil }
+        }
+    } catch { }
+    return $o
+}
+
+function Set-UiSpawnState {
+    param($State)
+    try {
+        $o = @{
+            spawnAt      = $(if ($State.spawnAt) { ([datetime]$State.spawnAt).ToString('o') } else { '' })
+            fastDeaths   = [int]$State.fastDeaths
+            backoffUntil = $(if ($State.backoffUntil) { ([datetime]$State.backoffUntil).ToString('o') } else { '' })
+            bootId       = $(if ($State.bootId) { [string]$State.bootId } else { '' })
+        }
+        [IO.File]::WriteAllText($script:UiSpawnPath, ($o | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+    } catch { }
+}
+
 function Get-PowerShellExe {
     $candidates = @(
         (Join-Path $PSHOME 'powershell.exe'),
@@ -305,6 +339,11 @@ function Start-FocusChild {
         $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         $psi.WorkingDirectory = $script:DataDir
         [void][System.Diagnostics.Process]::Start($psi)
+        if ($ChildMode -eq 'lock-ui') {
+            $st = Get-UiSpawnState
+            $st.spawnAt = Get-Date
+            Set-UiSpawnState -State $st
+        }
         return $true
     } catch {
         Write-FocusLog 'child-start-fail' "$ChildMode : $($_.Exception.Message)"
@@ -998,7 +1037,11 @@ function Invoke-Unlock {
     if (Get-LockWindow -Config $cfg -At $now) {
         $clickAt = (Get-Process -Id $PID).StartTime
         $readyAt = Get-LockUiReadyAt
-        if (($null -eq $readyAt) -or ($clickAt -lt $readyAt.AddSeconds($script:UnlockGraceSeconds))) {
+        $spawn = Get-UiSpawnState
+        if (($null -eq $readyAt) -and ($spawn.fastDeaths -ge 1)) {
+            # 遮罩起来过、但被外部结束（杀软）：此时屏幕上没有锁，再拒绝只会把遮罩又拉起来
+            Write-FocusLog 'unlock-mask-dead' ("遮罩已被外部结束 {0} 次，直接解锁" -f $spawn.fastDeaths)
+        } elseif (($null -eq $readyAt) -or ($clickAt -lt $readyAt.AddSeconds($script:UnlockGraceSeconds))) {
             $detail = if ($readyAt) { '遮罩 {0:HH:mm:ss}，仅 {1:N1} 秒' -f $readyAt, ($clickAt - $readyAt).TotalSeconds } else { '遮罩 无记录' }
             Write-FocusLog 'unlock-refused' $detail
             Write-Host '正在锁定：遮罩稳定显示后才能解锁。' -ForegroundColor Yellow
@@ -1038,6 +1081,14 @@ function Invoke-Unlock {
     }
 
     Set-TaskbarHidden -Hidden $false
+
+    $stx = Get-UiSpawnState
+    if ($stx.fastDeaths -ne 0 -or $stx.backoffUntil) {
+        $stx.fastDeaths = 0
+        $stx.backoffUntil = $null
+        Set-UiSpawnState -State $stx
+    }
+
     Write-FocusLog 'unlock-done' ''
 }
 
@@ -1513,7 +1564,40 @@ function Invoke-TickCore {
     $gdAlive = Test-NamedMutexHeld $script:MutexGuard
 
     if (-not $gdAlive) { [void](Start-FocusChild -ChildMode 'guard') }
-    if (-not $uiAlive) { [void](Start-FocusChild -ChildMode 'lock-ui') }
+
+    if ($uiAlive) {
+        # 活着：清掉死亡计数和退避
+        $st = Get-UiSpawnState
+        if ($st.fastDeaths -ne 0 -or $st.backoffUntil) {
+            $st.fastDeaths = 0
+            $st.backoffUntil = $null
+            Set-UiSpawnState -State $st
+        }
+        return
+    }
+
+    # 上一轮 spawn 的遮罩已经不在了
+    $st = Get-UiSpawnState
+    $nowT = Get-Date
+
+    # 退避期内什么都不做（不打日志、不加计数），避免每分钟闪一次也避免刷日志
+    if ($st.backoffUntil -and $nowT -lt [datetime]$st.backoffUntil) { return }
+
+    if ($st.spawnAt) {
+        $st.fastDeaths++
+        Write-FocusLog 'mask-killed' ("遮罩启动后又消失，第 {0} 次（多为杀软结束进程）" -f $st.fastDeaths)
+    }
+
+    if ($st.fastDeaths -ge 3) {
+        $st.backoffUntil = $nowT.AddMinutes(5)
+        $st.fastDeaths = 0
+        Set-UiSpawnState -State $st
+        Write-FocusLog 'mask-flapping' '遮罩反复被结束，5 分钟内不再拉起（请把 FocusLock 目录加入杀软信任区）'
+        return
+    }
+
+    Set-UiSpawnState -State $st
+    [void](Start-FocusChild -ChildMode 'lock-ui')
 }
 
 function Invoke-Tick {

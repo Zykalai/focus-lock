@@ -255,6 +255,7 @@ Enable-ScheduledTask  -TaskName FocusLockGuard
 - 计划任务最小重复间隔 1 分钟，切换点落在 90 秒外的时段靠下一次 tick 接手
 - 任务管理器优先用 `DisableTaskMgr` 策略拦；策略写不进去时降级为每 2 秒杀进程，存在约 2 秒窗口
 - 没有防破解；安全模式、任务管理器、直接改 JSON 都能绕过
+- 杀软可能把遮罩当可疑进程结束（它要装全局键盘钩子、藏任务栏、拦任务管理器）。出现这种情况时：`focuslock.log` 会连记 `mask-killed`，连续 3 次后写一条 `mask-flapping` 并退避 5 分钟不再拉起（避免每分钟闪一次）；此时双击 `unlock.cmd` 会直接放行并记 `unlock-mask-dead`，不会把你锁死。根治办法是把 `%LOCALAPPDATA%\FocusLock` 加进杀软信任区
 - `native.dll` 首次生成时如果 `Add-Type` 失败，会自动退回进程内编译，功能不受影响
 - 只覆盖主屏 + 任务栏层级，不接管 UAC 安全桌面、登录界面、其他用户会话
 - 依赖 Windows PowerShell 5.1 与 WinForms，没有做 PowerShell 7 / ARM64 适配
