@@ -8,12 +8,46 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.9'
+$script:Version    = '1.3.0'
 
 # 遮罩要稳定显示这么久才认解锁：刚 Shown 的头几秒窗口还没真正画到屏幕上，
 # 这时候的双击算抢跑（开机那几秒最容易撞上）
 $script:UnlockGraceSeconds = 10
-$script:DataDir    = Join-Path $env:LOCALAPPDATA 'FocusLock'
+function Resolve-DataDir {
+
+    # 选真实数据目录：候选里挑 focuslock.log 最新的那个（tick 每分钟都在写，
+    # 所以真实目录的日志一定是最新的；沙箱镜像/别的用户目录会落在后面）
+    $cands = New-Object System.Collections.Generic.List[string]
+    if ($env:LOCALAPPDATA) { $cands.Add((Join-Path $env:LOCALAPPDATA 'FocusLock')) }
+    try {
+        $fs = [Environment]::GetFolderPath('LocalApplicationData')
+        if ($fs) { $cands.Add((Join-Path $fs 'FocusLock')) }
+    } catch { }
+    if ($env:USERPROFILE) { $cands.Add((Join-Path $env:USERPROFILE 'AppData\Local\FocusLock')) }
+    try {
+        foreach ($u in [IO.Directory]::GetDirectories('C:\Users')) {
+            $cands.Add((Join-Path $u 'AppData\Local\FocusLock'))
+        }
+    } catch { }
+
+    $best = $null
+    $bestTime = [datetime]::MinValue
+    foreach ($c in ($cands | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $c 'config.json'))) { continue }
+        $log = Join-Path $c 'focuslock.log'
+        $tm = [datetime]::MinValue
+        if (Test-Path -LiteralPath $log) {
+            try { $tm = (Get-Item -LiteralPath $log).LastWriteTime } catch { }
+        }
+        if ($tm -gt $bestTime) { $bestTime = $tm; $best = $c }
+    }
+    if ($best) { return $best }
+
+    # 都没有：退回当前环境变量（首次安装就是这个分支）
+    return (Join-Path $env:LOCALAPPDATA 'FocusLock')
+}
+
+$script:DataDir    = Resolve-DataDir
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:StatePath  = Join-Path $script:DataDir 'state.json'
 $script:ManualPath = Join-Path $script:DataDir 'manual.json'
@@ -1052,7 +1086,21 @@ function Invoke-Unlock {
     }
     if ($set.Manual) {
         Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
-        # 删不掉就不能算解锁：沙箱/只读目录/权限受限时，静默失败会让上层以为成功
+        # 主目录删不掉时，逐个尝试其它候选目录（别的环境重定向了 %LOCALAPPDATA% 时能兜住）
+        if (Test-Path -LiteralPath $script:ManualPath) {
+            $others = New-Object System.Collections.Generic.List[string]
+            if ($env:USERPROFILE) { $others.Add((Join-Path $env:USERPROFILE 'AppData\Local\FocusLock')) }
+            try { foreach ($u in [IO.Directory]::GetDirectories('C:\Users')) { $others.Add((Join-Path $u 'AppData\Local\FocusLock')) } } catch { }
+            foreach ($d in ($others | Select-Object -Unique)) {
+                $mf = Join-Path $d 'manual.json'
+                if ((Test-Path -LiteralPath $mf) -and ($d -ne $script:DataDir)) {
+                    Remove-Item -LiteralPath $mf -Force -ErrorAction SilentlyContinue
+                    if (-not (Test-Path -LiteralPath $mf)) {
+                        Write-FocusLog 'unlock-alt-dir' ("清掉了另一份锁标记: {0}" -f $d)
+                    }
+                }
+            }
+        }
         if (Test-Path -LiteralPath $script:ManualPath) {
             Write-FocusLog 'unlock-failed' '定时区间 删除失败（无写权限或被占用）'
             Write-Host '解锁失败：无法删除锁定标记，可能没有写权限。' -ForegroundColor Red
