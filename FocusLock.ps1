@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:AppName    = 'FocusLock'
-$script:Version    = '1.2.8'
+$script:Version    = '1.2.9'
 
 # 遮罩要稳定显示这么久才认解锁：刚 Shown 的头几秒窗口还没真正画到屏幕上，
 # 这时候的双击算抢跑（开机那几秒最容易撞上）
@@ -1052,10 +1052,23 @@ function Invoke-Unlock {
     }
     if ($set.Manual) {
         Remove-Item -LiteralPath $script:ManualPath -Force -ErrorAction SilentlyContinue
+        # 删不掉就不能算解锁：沙箱/只读目录/权限受限时，静默失败会让上层以为成功
+        if (Test-Path -LiteralPath $script:ManualPath) {
+            Write-FocusLog 'unlock-failed' '定时区间 删除失败（无写权限或被占用）'
+            Write-Host '解锁失败：无法删除锁定标记，可能没有写权限。' -ForegroundColor Red
+            exit 4
+        }
         $did += '定时区间'
     }
     if ($set.Auto -and $set.AutoWin) {
         Set-Dismissed -Key $set.AutoWin.Key
+        $script:StateCache.Stamp = $null
+        $check = Get-Dismissed
+        if ($check -ne $set.AutoWin.Key) {
+            Write-FocusLog 'unlock-failed' '熬夜区间 状态写入失败'
+            Write-Host '解锁失败：无法写入解锁状态。' -ForegroundColor Red
+            exit 4
+        }
         $did += '熬夜区间'
     }
     if ($did.Count -gt 0) {
@@ -1081,6 +1094,13 @@ function Invoke-Unlock {
     }
 
     Set-TaskbarHidden -Hidden $false
+
+    # 清理完再确认：遮罩还在就是没解开，别报成功
+    if (Test-NamedMutexHeld $script:MutexUI) {
+        Write-FocusLog 'unlock-failed' '遮罩进程仍在运行'
+        Write-Host '解锁失败：遮罩进程仍在运行。' -ForegroundColor Red
+        exit 4
+    }
 
     $stx = Get-UiSpawnState
     if ($stx.fastDeaths -ne 0 -or $stx.backoffUntil) {
